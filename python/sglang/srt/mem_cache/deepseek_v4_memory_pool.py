@@ -244,6 +244,80 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
 
 
+class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
+    """HiSparse C4 device hot pool for unified-KV mode (ROCm, M2.1).
+
+    In separate-KV the C4 device hot buffer is a standalone byte-packed FP8
+    allocation (``HiSparseC4DevicePool``). In unified-KV the compressed C4 KV
+    physically lives inside the unified pool's ``rows[swa_pages:]`` (bf16,
+    ``head_dim`` wide). This pool therefore does **not** allocate its own
+    buffer; it binds per-C4-layer *views* into that compressed region so the
+    HiSparse hot/cold machinery (index mapping + ``DeepSeekV4PagedHostPool``
+    cold mirror) targets the unified compressed rows directly, while leaving
+    ``unified_kv_pool.kv_buffer`` as the single PD-friendly contiguous
+    allocation reported by ``get_contiguous_buf_infos``.
+
+    Because each view starts at ``swa_pages``, ``kv_buffer[hisparse_idx]`` lands
+    on unified row ``swa_pages + hisparse_idx`` automatically; callers that need
+    the absolute unified row (write/read remap, coordinator swap target) add the
+    ``swa_pages`` offset explicitly — that wiring is M2.2.
+
+    Layout is bf16 ``head_dim`` (not the byte-packed FP8 layout of separate-KV),
+    so the host-mirror item geometry is ``head_dim * itemsize`` bytes/row. The
+    byte-packed write accessors inherited from ``HiSparseC4DevicePool``
+    (``set_key_buffer``*) are not valid for this bf16 layout and are left for
+    M2.2 to remap; M2.1 only exercises construction + index allocation/rollback.
+    """
+
+    def __init__(
+        self,
+        unified_kv_pool: "DeepSeekV4UnifiedKVPool",
+        c4_local_layer_ids: List[int],
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        # Intentionally skip DeepSeekV4SingleKVPool.__init__: we must not
+        # allocate a second device buffer. The unified pool already owns the
+        # compressed-region storage; we only alias it.
+        self.unified_kv_pool = unified_kv_pool
+        self.swa_pages = unified_kv_pool.swa_pages
+        self.head_dim = unified_kv_pool.head_dim
+        self.compress_ratio = 4
+
+        self.page_size = page_size
+        self.dtype = dtype
+        self.store_dtype = dtype
+        self.device = device
+        self.layer_num = len(c4_local_layer_ids)
+        self.start_layer = 0
+        self.end_layer = self.layer_num
+
+        # Per-C4-layer views into rows[swa_pages:] of each unified buffer,
+        # ordered by C4-local layer id so layer_mapping.compress_layer_id
+        # indexes this list the same way as separate-KV's c4_kv_pool.
+        self.kv_buffer = [
+            unified_kv_pool.kv_buffer[local_id][self.swa_pages :]
+            for local_id in c4_local_layer_ids
+        ]
+        # Device-resident compressed rows available for the C4 hot region.
+        self.size = self.kv_buffer[0].shape[0] if self.kv_buffer else 0
+
+        # Host-mirror item geometry: one bf16 head_dim row per token, with
+        # ``page_size`` rows per page. store_dtype == dtype (bf16) so no view
+        # reinterpret is needed in get_key_buffer.
+        self.kv_cache_total_dim = self.head_dim
+        self.bytes_per_page_padded = (
+            self.page_size * self.head_dim * self.store_dtype.itemsize
+        )
+
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
@@ -523,6 +597,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._unified_kv = is_unified_kv_triton()
 
+        self.unified_hisparse = False
         if self._unified_kv:
             self.swa_kv_pool = None
             self.c4_kv_pool = None
@@ -548,6 +623,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_swa_window = self.sliding_window
             self.unified_swa_ring_size = self.sliding_window + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
+
+            # M2.1: build the HiSparse hot/cold pool over the unified
+            # compressed region (rows[swa_pages:]). ROCm-only for now; the
+            # unified write/read remap + bf16 swap kernel are M2.2/M2.3.
+            if enable_hisparse and _is_hip:
+                c4_local_layer_ids = [
+                    i for i, r in enumerate(stage_ratios) if r == 4
+                ]
+                self.c4_kv_pool = HiSparseUnifiedC4DevicePool(
+                    unified_kv_pool=self.unified_kv_pool,
+                    c4_local_layer_ids=c4_local_layer_ids,
+                    page_size=c4_page_size,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                self.unified_hisparse = True
         else:
             self.unified_kv_pool = None
             self.swa_kv_pool = DeepSeekV4SingleKVPool(
