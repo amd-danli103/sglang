@@ -1,4 +1,4 @@
-"""L1 unit tests for the unified-KV HiSparse device pool (M2.1).
+"""Unit tests for the unified-KV HiSparse device pool.
 
 These tests cover ``HiSparseUnifiedC4DevicePool`` — the HiSparse C4 device hot
 pool used in unified-KV mode (ROCm). Unlike separate-KV, the compressed C4 KV
@@ -6,14 +6,14 @@ lives inside ``DeepSeekV4UnifiedKVPool``'s ``rows[swa_pages:]`` (bf16,
 ``head_dim`` wide); this pool binds per-C4-layer *views* into that region and
 reuses the HiSparse index-mapping machinery.
 
-Scope (M2.1):
+Scope:
 - view aliasing onto the unified compressed region (rows[swa_pages:]),
 - host-mirror item geometry (bf16 head_dim row),
 - the page_size==1 logical->hisparse-device allocation / rollback path,
   mirroring ``test_hisparse_unit.py``'s page_size==1 staging logic.
 
-Write/read remap and the bf16 swap-in kernel are M2.2/M2.3 and not exercised
-here.
+These are component-level checks of pool construction and index allocation; the
+end-to-end write/read swap path is covered by integration runs rather than here.
 """
 
 import unittest

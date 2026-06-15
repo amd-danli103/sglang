@@ -68,6 +68,19 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        # unified-KV HiSparse (ROCm) keeps the compressed C4 hot/cold data in
+        # the bf16 unified layout, so swap-in/backup use the generic linear MLA
+        # path instead of the FP8 page-padded dsv4 path.
+        self.is_unified_hisparse = False
+        if self.is_dsv4_hisparse:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                HiSparseUnifiedC4DevicePool,
+            )
+
+            self.is_unified_hisparse = isinstance(
+                self.token_to_kv_pool_allocator.hisparse_kvcache,
+                HiSparseUnifiedC4DevicePool,
+            )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -820,11 +833,13 @@ class HiSparseCoordinator:
 
         # todo, adjustable for performance
         block_size = 1024
-        swap_in_fn = (
-            load_cache_to_device_buffer_dsv4_mla
-            if self.is_dsv4_hisparse
-            else load_cache_to_device_buffer_mla
-        )
+        if self.is_dsv4_hisparse and not self.is_unified_hisparse:
+            # separate-KV: FP8 page-padded device + host C4 layout.
+            swap_in_fn = load_cache_to_device_buffer_dsv4_mla
+        else:
+            # unified-KV HiSparse (bf16 linear rows) and generic DSA MLA both
+            # use the linear swap path (stride == item_size_bytes).
+            swap_in_fn = load_cache_to_device_buffer_mla
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],

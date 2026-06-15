@@ -246,7 +246,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
 
 class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
-    """HiSparse C4 device hot pool for unified-KV mode (ROCm, M2.1).
+    """HiSparse C4 device hot pool for unified-KV mode (ROCm).
 
     In separate-KV the C4 device hot buffer is a standalone byte-packed FP8
     allocation (``HiSparseC4DevicePool``). In unified-KV the compressed C4 KV
@@ -260,14 +260,16 @@ class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
 
     Because each view starts at ``swa_pages``, ``kv_buffer[hisparse_idx]`` lands
     on unified row ``swa_pages + hisparse_idx`` automatically; callers that need
-    the absolute unified row (write/read remap, coordinator swap target) add the
-    ``swa_pages`` offset explicitly — that wiring is M2.2.
+    the absolute unified row (the compressor write path and the coordinator
+    swap-in target) add the ``swa_pages`` offset explicitly.
 
     Layout is bf16 ``head_dim`` (not the byte-packed FP8 layout of separate-KV),
-    so the host-mirror item geometry is ``head_dim * itemsize`` bytes/row. The
-    byte-packed write accessors inherited from ``HiSparseC4DevicePool``
-    (``set_key_buffer``*) are not valid for this bf16 layout and are left for
-    M2.2 to remap; M2.1 only exercises construction + index allocation/rollback.
+    so the host-mirror item geometry is ``head_dim * itemsize`` bytes/row and
+    swap-in/backup use the generic linear MLA path rather than the FP8
+    page-padded path. The byte-packed write accessors inherited from
+    ``HiSparseC4DevicePool`` (``set_key_buffer``*) are not used in this mode; the
+    unified bf16 write is performed by the compressor's ``forward_unified`` store
+    path after remapping the compressed slot to its hot device row.
     """
 
     def __init__(
@@ -642,17 +644,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_swa_ring_size = self.sliding_window + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
 
-            # M2.1: build the HiSparse hot/cold pool over the unified
-            # compressed region (rows[swa_pages:]). ROCm-only for now; the
-            # unified write/read remap + bf16 swap kernel are M2.2/M2.3.
+            # Build the HiSparse hot/cold pool over the unified compressed
+            # region (rows[swa_pages:]). ROCm-only.
             if enable_hisparse and _is_hip:
                 c4_local_layer_ids = [
                     i for i, r in enumerate(stage_ratios) if r == 4
                 ]
+                # Unified CSA addressing is row-granular: the compressed slot
+                # id is a row index into rows[swa_pages:], and the unified
+                # read/swap kernels operate at page_size==1. So the hot/cold
+                # pool is per-row bf16 (page_size=1), independent of the logical
+                # SWA page size.
                 self.c4_kv_pool = HiSparseUnifiedC4DevicePool(
                     unified_kv_pool=self.unified_kv_pool,
                     c4_local_layer_ids=c4_local_layer_ids,
-                    page_size=c4_page_size,
+                    page_size=1,
                     dtype=torch.bfloat16,
                     device=device,
                 )
