@@ -8,9 +8,17 @@ host cold pool; swap-in runs outside CUDA/HIP graph capture (the hot buffer
 shape is fixed), so decode replays a captured graph while compressed C4 tokens
 are streamed in from host on demand.
 
-- Accuracy: GSM8K few-shot eval; must align with the dense baseline.
-- Capacity: a long-context request that overflows the GPU-resident hot buffer,
-  demonstrating host<->device swap.
+Two complementary checks:
+- ``test_a_gsm8k`` — accuracy/sparse-selection guard: GSM8K few-shot eval must
+  align with the dense baseline. NOTE: GSM8K prompts (~1k tokens) stay fully
+  device-resident, so this case validates HiSparse top-k selection numerics but
+  does NOT exercise the host<->device swap data path.
+- ``test_b_long_context_swap`` — swap-path guard: a ~19k-token request whose
+  compressed C4 footprint overflows the GPU-resident hot buffer
+  (``device_buffer_size``), forcing cold C4 tokens to be swapped in from the
+  host pool on demand. A unique passcode buried at the top must be retrieved,
+  so the swap kernel is validated end-to-end (correct cold->hot copy), not just
+  sparse selection.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-hisparse-unified suite
 """
@@ -20,6 +28,9 @@ import resource
 import unittest
 from types import SimpleNamespace
 
+import requests
+
+import sglang.test as sglang_test_pkg
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -69,9 +80,12 @@ COMMON_ENV_VARS = {
 }
 
 # HiSparse config: top_k aligned to the model's index_topk (1024); the hot
-# device buffer holds device_buffer_size compressed tokens, the rest live in
-# the host cold pool and are swapped in per top-k selection.
-HISPARSE_CONFIG = '{"top_k": 1024, "device_buffer_size": 2048, "host_to_device_ratio": 1}'
+# device buffer holds device_buffer_size compressed tokens. host_to_device_ratio
+# = 2 makes the logical compressed space twice the device-resident C4 pool, so
+# roughly half of the compressed tokens live in the host cold pool and are
+# swapped in per top-k selection (also exercises the c4_shrink_factor offload
+# provisioning path, which ratio=1 leaves uncovered).
+HISPARSE_CONFIG = '{"top_k": 1024, "device_buffer_size": 2048, "host_to_device_ratio": 2}'
 
 
 class TestDeepseekV4ProFp8HiSparseUnifiedMI35x(CustomTestCase):
@@ -151,6 +165,69 @@ class TestDeepseekV4ProFp8HiSparseUnifiedMI35x(CustomTestCase):
             )
         # unified_kv + HiSparse must align with the dense DSV4-Pro baseline.
         self.assertGreater(metrics["accuracy"], 0.90)
+
+    def test_b_long_context_swap(self):
+        """Exercise the host<->device swap path end-to-end.
+
+        GSM8K prompts (~1k tokens) stay fully device-resident and never swap.
+        Here we build a ~19k-token prompt whose compressed C4 footprint clearly
+        exceeds device_buffer_size (2048), so cold C4 tokens must be streamed in
+        from the host pool on every decode step. A unique passcode is buried at
+        the very top of the context; retrieving it correctly is only possible if
+        the swap-in kernel copies the cold C4 KV into the hot buffer correctly,
+        so this guards the swap data path (not just sparse selection).
+        """
+        # long_prompt.txt (~6.4k tokens) lives next to the sglang.test package.
+        dirpath = os.path.dirname(sglang_test_pkg.__file__)
+        with open(os.path.join(dirpath, "long_prompt.txt")) as f:
+            filler = f.read()
+        # Repeat 3x -> ~19k prompt tokens, well past device_buffer_size (2048),
+        # so the compressed C4 footprint overflows the hot buffer with margin
+        # and forces host->device swap (verified: ~4.9k tokens stay host-side).
+        filler = filler * 3
+
+        passcode = "7G-ZULU-4419"
+        prompt = (
+            f"Remember this passcode exactly: {passcode}. "
+            "You will be asked to recall it at the end.\n\n"
+            f"{filler}\n\n"
+            "Question: What is the exact passcode given at the very beginning of "
+            "this message? Reply with only the passcode, nothing else."
+        )
+
+        # Use the chat endpoint (applies the chat template + reasoning); the raw
+        # /generate completion path degenerates into repetition on this reasoning
+        # model and is not a reliable retrieval probe.
+        resp = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 1024,
+            },
+            timeout=900,
+        )
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"]
+        # The passcode may land in either the reasoning trace or the final answer.
+        text = (message.get("reasoning_content") or "") + "\n" + (
+            message.get("content") or ""
+        )
+        print(f"long_context_swap completion={text!r}")
+
+        retrieved = passcode in text
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_long_context_swap (deepseek-v4-pro-fp8 unified_kv hisparse)\n"
+                f"{retrieved=}\n"
+            )
+        # Correct retrieval from a swapped-in cold region proves the
+        # host<->device swap path works end-to-end.
+        self.assertTrue(
+            retrieved,
+            f"passcode {passcode!r} not found in completion: {text!r}",
+        )
 
 
 if __name__ == "__main__":
