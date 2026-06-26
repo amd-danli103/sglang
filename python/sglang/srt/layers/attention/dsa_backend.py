@@ -385,13 +385,30 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_metadata_kv_dtype = None
             self.aiter_dsa_kv_last_page_lens = None
             self.aiter_dsa_work_metadata = None
+            # Upper bound on the batch_size ever passed to the aiter DSA decode
+            # metadata buffers. Decode uses <= max_bs, but the eager extend path
+            # passes num_tokens up to the prefill token budget. These buffers are
+            # baked into the captured decode CUDA/HIP graph, so they MUST be
+            # provisioned at this bound once (below) and never reallocated at
+            # runtime: a post-capture realloc frees the buffers the captured graph
+            # references and leaves it reading freed/aliased memory.
+            _server_args = model_runner.server_args
+            _max_forward_tokens = _server_args.max_prefill_tokens
+            if (
+                _server_args.chunked_prefill_size is not None
+                and _server_args.chunked_prefill_size > 0
+            ):
+                _max_forward_tokens = max(
+                    _max_forward_tokens, _server_args.chunked_prefill_size
+                )
+            self.aiter_dsa_metadata_max_batch = max(max_bs, _max_forward_tokens)
 
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
             ) and model_runner.kv_cache_dtype == fp8_dtype:
                 self._ensure_aiter_dsa_decode_metadata_buffer(
                     max_seqlen_q=1,
-                    batch_size=max_bs,
+                    batch_size=self.aiter_dsa_metadata_max_batch,
                     q_dtype=torch.bfloat16,
                     kv_dtype=fp8_dtype,
                 )
@@ -484,6 +501,20 @@ class DeepseekSparseAttnBackend(
         ):
             return
 
+        if (
+            self.aiter_dsa_work_metadata is not None
+            and batch_size > self.aiter_dsa_metadata_capacity
+        ):
+            raise RuntimeError(
+                f"Requested batch_size {batch_size} exceeds the preallocated "
+                f"aiter DSA metadata capacity {self.aiter_dsa_metadata_capacity}. "
+                "Reallocation after graph capture is not allowed as it will corrupt the captured graph."
+            )
+        # Always (re)allocate at the provisioning bound, never at the exact
+        # requested size, so the buffers reach their maximum footprint on the
+        # first call (warmup / graph capture) and are never reallocated after the
+        # decode graph bakes their pointers. See aiter_dsa_metadata_max_batch.
+        alloc_batch_size = max(batch_size, self.aiter_dsa_metadata_max_batch)
         (
             self.aiter_dsa_work_metadata,
             self.aiter_dsa_work_indptr,
@@ -493,14 +524,14 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_reduce_partial_map,
         ) = self._make_aiter_dsa_decode_metadata_buffer(
             max_seqlen_q=max_seqlen_q,
-            batch_size=batch_size,
+            batch_size=alloc_batch_size,
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
         )
         self.aiter_dsa_kv_last_page_lens = torch.ones(
-            (batch_size,), dtype=torch.int32, device=self.device
+            (alloc_batch_size,), dtype=torch.int32, device=self.device
         )
-        self.aiter_dsa_metadata_capacity = batch_size
+        self.aiter_dsa_metadata_capacity = alloc_batch_size
         self.aiter_dsa_metadata_max_seqlen_q = max_seqlen_q
         self.aiter_dsa_metadata_q_dtype = q_dtype
         self.aiter_dsa_metadata_kv_dtype = kv_dtype
