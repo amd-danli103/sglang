@@ -13,6 +13,9 @@ import resource
 import unittest
 from types import SimpleNamespace
 
+import requests
+
+import sglang.test as sglang_test_pkg
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -59,7 +62,10 @@ COMMON_ENV_VARS = {
     "SGLANG_EAGER_INPUT_NO_COPY": "true",
 }
 
-HISPARSE_CONFIG = '{"top_k": 1024, "device_buffer_size": 2048, "host_to_device_ratio": 1}'
+# ratio=4 exercises the C4 offload/shrink path under DP (ratio=1 leaves it uncovered).
+HISPARSE_CONFIG = (
+    '{"top_k": 1024, "device_buffer_size": 2048, "host_to_device_ratio": 4}'
+)
 
 
 class TestDeepseekV4ProFp8HiSparseUnifiedDPMI35x(CustomTestCase):
@@ -138,6 +144,58 @@ class TestDeepseekV4ProFp8HiSparseUnifiedDPMI35x(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
             )
         self.assertGreater(metrics["accuracy"], 0.90)
+
+    def test_b_long_context_swap(self):
+        """Exercise the host<->device swap path under DP attention.
+
+        GSM8K prompts (~1k tokens) stay device-resident and never swap. A
+        ~19k-token prompt overflows the shrunk on-device C4 hot region, forcing
+        cold C4 tokens to stream in from the host pool; a passcode buried at the
+        top must be retrieved, so the swap kernel is validated end-to-end.
+        """
+        dirpath = os.path.dirname(sglang_test_pkg.__file__)
+        with open(os.path.join(dirpath, "long_prompt.txt")) as f:
+            filler = f.read()
+        filler = filler * 3
+
+        passcode = "7G-ZULU-4419"
+        prompt = (
+            f"Remember this passcode exactly: {passcode}. "
+            "You will be asked to recall it at the end.\n\n"
+            f"{filler}\n\n"
+            "Question: What is the exact passcode given at the very beginning of "
+            "this message? Reply with only the passcode, nothing else."
+        )
+
+        resp = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 1024,
+            },
+            timeout=900,
+        )
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"]
+        text = (
+            (message.get("reasoning_content") or "")
+            + "\n"
+            + (message.get("content") or "")
+        )
+        print(f"long_context_swap completion={text!r}")
+
+        retrieved = passcode in text
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_long_context_swap (deepseek-v4-pro-fp8 unified_kv hisparse DP-attn)\n"
+                f"{retrieved=}\n"
+            )
+        self.assertTrue(
+            retrieved,
+            f"passcode {passcode!r} not found in completion: {text!r}",
+        )
 
 
 if __name__ == "__main__":
