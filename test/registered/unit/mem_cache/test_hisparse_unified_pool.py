@@ -105,6 +105,41 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
             self.assertEqual(tuple(buf.shape), (C4_ROWS, HEAD_DIM))
             self.assertEqual(buf.dtype, torch.bfloat16)
 
+    def test_c4_compress_pages_shrinks_device_region(self):
+        """c4_compress_pages shrinks the device C4 region; c128 layers unchanged."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4UnifiedKVPool,
+        )
+
+        stage_ratios = [4, 128, 4]
+        # Shrink the device C4 region below the logical budget (NUM_BLOCKS*32).
+        c4_device_rows = C4_ROWS // 2
+        unified = DeepSeekV4UnifiedKVPool(
+            stage_ratios=stage_ratios,
+            num_slots=NUM_SLOTS,
+            num_blocks=NUM_BLOCKS,
+            c4_compress_pages=c4_device_rows,
+            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            device="cuda",
+            memory_saver_adapter=_fake_memory_saver_adapter(),
+            custom_mem_pool=None,
+            swa_ring_size=SWA_RING_SIZE,
+        )
+        swa_pages = unified.swa_pages
+
+        # c4 layers (0, 2): swa_pages + shrunk device rows.
+        for local_id in (0, 2):
+            self.assertEqual(
+                unified.kv_buffer[local_id].shape[0], swa_pages + c4_device_rows
+            )
+        # c128 layer (1): unchanged (num_blocks * 1).
+        self.assertEqual(unified.kv_buffer[1].shape[0], swa_pages + NUM_BLOCKS * 1)
+
+        # The HiSparse hot pool aliases the shrunk region -> its size follows.
+        pool, _ = self._build_hisparse_pool(unified, stage_ratios)
+        self.assertEqual(pool.size, c4_device_rows)
+
     # ------------------------------------------------------------------
     # View aliasing onto rows[swa_pages:]
     # ------------------------------------------------------------------
@@ -131,9 +166,7 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
                 )
             )
             # SWA region (rows[:swa_pages]) is untouched.
-            self.assertTrue(
-                torch.all(unified.kv_buffer[local_id][:swa_pages] == 0)
-            )
+            self.assertTrue(torch.all(unified.kv_buffer[local_id][:swa_pages] == 0))
 
     # ------------------------------------------------------------------
     # Host-mirror item geometry (bf16 head_dim row)
@@ -172,7 +205,9 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         logical_size = 64
         mapping = torch.cat(
             [
-                torch.zeros(logical_size + pool.page_size, dtype=torch.int64, device="cuda"),
+                torch.zeros(
+                    logical_size + pool.page_size, dtype=torch.int64, device="cuda"
+                ),
                 torch.tensor([-1], dtype=torch.int64, device="cuda"),
             ]
         )
@@ -202,9 +237,7 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
 
         # Roundtrip translate returns what we stored (as int32).
         translated = pool.translate_loc_to_hisparse_device(logical_indices)
-        self.assertTrue(
-            torch.equal(translated.long(), hisparse_indices.long())
-        )
+        self.assertTrue(torch.equal(translated.long(), hisparse_indices.long()))
         self.assertTrue(
             torch.all(pool.full_to_hisparse_device_index_mapping[logical_indices] > 0)
         )
@@ -215,9 +248,7 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         pool.full_to_hisparse_device_index_mapping[logical_indices] = 0
         self.assertEqual(hisparse_alloc.available_size(), initial_avail)
         self.assertTrue(
-            torch.all(
-                pool.full_to_hisparse_device_index_mapping[logical_indices] == 0
-            )
+            torch.all(pool.full_to_hisparse_device_index_mapping[logical_indices] == 0)
         )
 
     def test_alloc_oversubscribe_returns_none(self):
