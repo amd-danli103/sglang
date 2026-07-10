@@ -1415,16 +1415,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key_component: ComponentType,
         tracker: dict[ComponentType, int],
     ) -> None:
-        """Free host pool space by evicting whole host leaves atomically until
-        ``tracker[key_component] >= num_tokens``.
-
-        Unlike a component's private host eviction, this drops every component
-        on each evicted leaf together (via ``_evict_host_leaf``), so component
-        host copies (e.g. Full and SWA) keep bound lifetimes. Used by strict
-        bit-exact SWA so a Full-host copy never outlives its SWA-host copy.
-        Leaf-only eviction also respects the Full anchor invariant (a parent is
-        only ever freed after its children, as children collapse to leaves).
+        """Evict whole host leaves atomically until
+        ``tracker[key_component] >= num_tokens``, dropping every component
+        (Full + SWA) on each leaf together. Used by strict bit-exact SWA so a
+        Full-host copy never outlives its SWA-host copy.
         """
+        full_before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        leaves = 0
         heap = [
             (self.eviction_strategy.get_priority(n), n)
             for n in self.evictable_host_leaves
@@ -1435,11 +1432,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if x not in self.evictable_host_leaves:
                 continue
             self._evict_host_leaf(x, tracker)
+            leaves += 1
             if x.parent is not None and x.parent in self.evictable_host_leaves:
                 heapq.heappush(
                     heap,
                     (self.eviction_strategy.get_priority(x.parent), x.parent),
                 )
+        # Full freed by an auxiliary component's (strict SWA) pressure: that pool
+        # is the binding constraint and may throttle Full hit rate.
+        if key_component != BASE_COMPONENT_TYPE:
+            self._note_binding_full_coevict(
+                tracker.get(BASE_COMPONENT_TYPE, 0) - full_before, leaves
+            )
+
+    def _note_binding_full_coevict(self, full_tokens: int, leaves: int) -> None:
+        if full_tokens <= 0 or leaves <= 0:
+            return
+        self._binding_full_coevict_tokens = (
+            getattr(self, "_binding_full_coevict_tokens", 0) + full_tokens
+        )
+        self._binding_full_coevict_leaves = (
+            getattr(self, "_binding_full_coevict_leaves", 0) + leaves
+        )
+        # Warn once, after enough samples to recommend a stable ratio.
+        if getattr(self, "_binding_full_coevict_warned", False):
+            return
+        if self._binding_full_coevict_leaves < 16:
+            return
+        self._binding_full_coevict_warned = True
+        avg_prefix_tokens = (
+            self._binding_full_coevict_tokens / self._binding_full_coevict_leaves
+        )
+        logger.warning(
+            "[SWA-HiCache] SWA host pool is the binding constraint: strict "
+            "co-eviction dropped Full-host copies to free SWA space, lowering "
+            "Full hit rate. Observed avg cached-prefix ~%.0f tokens (sizing "
+            "assumes 50000). Set --hicache-swa-avg-seq-len %.0f, or run "
+            "best-effort (SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE=0) for "
+            "short-prefix workloads.",
+            avg_prefix_tokens,
+            avg_prefix_tokens,
+        )
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
         """D-leaf: Full device value present, no child with Full KV on device,

@@ -2059,6 +2059,10 @@ class ServerArgs:
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
     ] = 0
+    hicache_swa_avg_seq_len: A[
+        Optional[int],
+        "Assumed average sequence length (tokens) of prefixes cached to host; sizes the strict bit-exact SWA-ring host pool (one window per cached prefix). Unset assumes ~50000 (long-context). Set it to your workload's average; the 'SWA->Full co-eviction' log recommends a value if it is too high.",
+    ] = None
     hicache_write_policy: A[
         str,
         Arg(

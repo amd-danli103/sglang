@@ -300,6 +300,39 @@ def _dsv4_swa_ring_region_buffers(kvcache: Any) -> tuple[list, int]:
     return buffers, item_bytes
 
 
+# Default assumed average sequence length (tokens) of prefixes cached to host;
+# each such prefix needs one SWA window across many full-KV pages.
+_SWA_HICACHE_DEFAULT_AVG_SEQ_LEN = 50_000
+# Above this per-rank size the SWA host pool warns that pinning may slow launch.
+_SWA_HICACHE_SLOW_LAUNCH_GB = 16.0
+
+
+def _swa_host_num_pages(
+    *, server_args, full_host_pages, device_ring_pages, page_bytes, page_size
+):
+    """SWA-ring host pool size in pages: one SWA window per host-cached prefix,
+    i.e. full_host_pages / (avg_seq_len / page_size). The customer's
+    --hicache-swa-avg-seq-len wins; floored at the device ring; a result above
+    _SWA_HICACHE_SLOW_LAUNCH_GB only warns (never clamps)."""
+    avg_seq_len = (
+        server_args.hicache_swa_avg_seq_len or _SWA_HICACHE_DEFAULT_AVG_SEQ_LEN
+    )
+    avg_seq_pages = max(1, -(-avg_seq_len // page_size))
+    pages = max(1, device_ring_pages, -(-full_host_pages // avg_seq_pages))
+    gb = pages * page_bytes / 1e9
+    if page_bytes and gb > _SWA_HICACHE_SLOW_LAUNCH_GB:
+        logger.warning(
+            "[SWA-HiCache] SWA host pool is %.1f GB/rank (>%.0f GB); host "
+            "pinning (cudaHostRegister) may slow server launch. Raise "
+            "--hicache-swa-avg-seq-len if prefixes are longer, or use "
+            "best-effort (SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE=0) for short "
+            "prefixes.",
+            gb,
+            _SWA_HICACHE_SLOW_LAUNCH_GB,
+        )
+    return pages
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -414,19 +447,31 @@ def build_deepseek_v4_hicache_stack(
         )
     elif unified_swa_hicache:
         swa_ring_buffers, swa_item_bytes = _dsv4_swa_ring_region_buffers(kvcache)
+        num_swa_layers = len(swa_ring_buffers)
+        page_bytes = swa_item_bytes * num_swa_layers
+        device_ring_pages = (
+            kvcache.unified_kv_pool.swa_pages + kvcache.swa_page_size - 1
+        ) // kvcache.swa_page_size
+        unified_swa_host_pages = _swa_host_num_pages(
+            server_args=server_args,
+            full_host_pages=num_host_pages,
+            device_ring_pages=device_ring_pages,
+            page_bytes=page_bytes,
+            page_size=page_size,
+        )
         logger.info(
-            "[SWA-HiCache] Building unified SWA-ring host pool: layers=%d, "
-            "swa_host_pages=%d, item_bytes=%d, swa_page_size=%d.",
-            len(swa_ring_buffers),
-            swa_num_host_pages,
-            swa_item_bytes,
-            kvcache.swa_page_size,
+            "[SWA-HiCache] SWA host pool: %d pages (%.2f GB), full_host_pages=%d, "
+            "layers=%d.",
+            unified_swa_host_pages,
+            unified_swa_host_pages * page_bytes / 1e9,
+            num_host_pages,
+            num_swa_layers,
         )
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
             device_buffers=swa_ring_buffers,
             item_bytes=swa_item_bytes,
-            num_host_pages=swa_num_host_pages,
+            num_host_pages=unified_swa_host_pages,
             slot_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
