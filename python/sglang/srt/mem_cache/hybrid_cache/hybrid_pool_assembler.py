@@ -850,6 +850,22 @@ class _DeepSeekV4Strategy(StackStrategy):
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
+        # Fail fast before allocating/pinning the SWA host pool: strict
+        # bit-exact needs write_through so the owning request offloads its
+        # true SWA window at insert time (while its ring slot is still valid).
+        # write_back defers the ring->host copy to eviction, by when the slot
+        # may have been recycled -> silent non-bit-exact reuse.
+        swa_bit_exact = getattr(
+            kvcache, "_unified_kv", False
+        ) and envs.SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE.get()
+        if swa_bit_exact and server_args.hicache_write_policy != "write_through":
+            raise ValueError(
+                "SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE requires "
+                "--hicache-write-policy write_through (got "
+                f"{server_args.hicache_write_policy!r}); write_back cannot "
+                "guarantee the SWA ring is offloaded before its slot is reused."
+            )
+
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
             server_args=server_args,
@@ -894,22 +910,6 @@ class _DeepSeekV4Strategy(StackStrategy):
         if PoolName.SWA in host_pool_group.entry_map:
             component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
                 PoolName.SWA
-            )
-
-        swa_bit_exact = getattr(
-            kvcache, "_unified_kv", False
-        ) and envs.SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE.get()
-        if swa_bit_exact and server_args.hicache_write_policy != "write_through":
-            # Bit-exact needs the owning request to offload its true SWA window
-            # to host at insert time, while its per-request ring slot is still
-            # valid. write_back defers the ring->host copy to eviction time, by
-            # when the slot may have been recycled (stale bytes) -> silent
-            # non-bit-exact reuse. Fail loud instead.
-            raise ValueError(
-                "SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE requires "
-                "--hicache-write-policy write_through (got "
-                f"{server_args.hicache_write_policy!r}); write_back cannot "
-                "guarantee the SWA ring is offloaded before its slot is reused."
             )
 
         return StackBuildResult(
