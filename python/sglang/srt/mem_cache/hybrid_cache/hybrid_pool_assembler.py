@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     import torch
@@ -281,6 +282,24 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+def _dsv4_swa_ring_region_buffers(kvcache: Any) -> tuple[list, int]:
+    """Resolve ``(device_buffers, item_bytes)`` for the unified_kv SWA ring.
+
+    The SWA ring occupies rows ``[0, swa_pages)`` of every unified layer buffer
+    (``req_pool_idx * swa_window + pos % swa_window`` addressing). One host page
+    mirrors ``swa_page_size`` consecutive ring rows, matching how the SWA host
+    pool pages the device ring.
+    """
+    assert getattr(kvcache, "_unified_kv", False)
+    swa_pages = kvcache.unified_kv_pool.swa_pages
+    row_bytes = kvcache.unified_kv_pool.kv_buffer[0][0].nbytes
+    buffers = [
+        buf.narrow(0, 0, swa_pages) for buf in kvcache.unified_kv_pool.kv_buffer
+    ]
+    item_bytes = kvcache.swa_page_size * row_bytes
+    return buffers, item_bytes
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -304,10 +323,20 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    # Strict bit-exact SWA HiCache: offload the unified SWA ring to a host pool
+    # and restore it on reuse instead of reprefilling the trailing 128-token tail.
+    unified_swa_hicache = (
+        is_unified_kv and envs.SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE.get()
+    )
     if is_unified_kv:
-        # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
-        # so there is no separate SWA host pool to map.
-        swa_layer_mapping = {}
+        # Flag OFF: unified_kv keeps the SWA ring device-only (no host pool).
+        # Flag ON: mirror every layer like the non-unified SWA path so the ring
+        # can be offloaded/restored.
+        swa_layer_mapping = (
+            {layer_id: layer_id for layer_id in range(transfer_layer_num)}
+            if unified_swa_hicache
+            else {}
+        )
     else:
         if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:
             raise ValueError(
@@ -375,6 +404,39 @@ def build_deepseek_v4_hicache_stack(
                 name=PoolName.SWA,
                 host_pool=swa_host_pool,
                 device_pool=kvcache.swa_kv_pool,
+                layer_mapping=swa_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_swa_evict_fn,
+                device_evict_fn=device_swa_evict_fn,
+                device_alloc_fn=swa_attn_allocator.alloc,
+                device_free_fn=swa_attn_allocator.free,
+            )
+        )
+    elif unified_swa_hicache:
+        swa_ring_buffers, swa_item_bytes = _dsv4_swa_ring_region_buffers(kvcache)
+        logger.info(
+            "[SWA-HiCache] Building unified SWA-ring host pool: layers=%d, "
+            "swa_host_pages=%d, item_bytes=%d, swa_page_size=%d.",
+            len(swa_ring_buffers),
+            swa_num_host_pages,
+            swa_item_bytes,
+            kvcache.swa_page_size,
+        )
+        swa_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.SWA),
+            device_buffers=swa_ring_buffers,
+            item_bytes=swa_item_bytes,
+            num_host_pages=swa_num_host_pages,
+            slot_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+        entries.append(
+            build_pool_entry(
+                name=PoolName.SWA,
+                host_pool=swa_host_pool,
+                device_pool=None,
                 layer_mapping=swa_layer_mapping,
                 transfer_layer_num=transfer_layer_num,
                 host_evict_fn=host_swa_evict_fn,
