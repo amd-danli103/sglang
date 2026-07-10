@@ -59,6 +59,11 @@ class SWAComponent(TreeComponent):
         self.sliding_window_size = params.sliding_window_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        # Strict bit-exact SWA HiCache (unified_kv only): when True, SWA host
+        # eviction must never drop a node's SWA copy while keeping its Full
+        # copy on host (that "Full-host without SWA-host" orphan would force a
+        # non-bit-exact tail reprefill on reuse). Wired at pool-attach time.
+        self._strict_bit_exact = False
 
     component_type = ComponentType.SWA
 
@@ -855,6 +860,14 @@ class SWAComponent(TreeComponent):
         Internal nodes: private tombstone (free SWA host only).
         Host leaves: atomic eviction via _evict_host_leaf."""
         ct = self.component_type
+        if self._strict_bit_exact:
+            # Bit-exact: free SWA host space only by evicting whole host leaves
+            # (atomic Full+SWA), never by tombstoning an internal node's SWA
+            # alone. This keeps the invariant "Full-host copy => SWA-host copy",
+            # so any Full-host hit can restore its true sliding window instead
+            # of reprefilling the tail. Sizing then only affects hit rate.
+            self.cache.drive_host_leaf_eviction(num_tokens, ct, tracker)
+            return
         host_lru = self.cache.host_lru_lists[ct]
         x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):

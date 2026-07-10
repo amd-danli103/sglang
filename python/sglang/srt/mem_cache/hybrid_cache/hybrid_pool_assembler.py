@@ -742,6 +742,9 @@ class StackBuildResult:
     host_pool_group: HostPoolGroup
     cache_controller: HybridCacheController
     component_host_pools: dict[ComponentType, Any]
+    # Strict bit-exact SWA HiCache (unified_kv only): couple SWA-host lifetime
+    # to Full-host via leaf-atomic eviction (no orphan tail). See SWAComponent.
+    swa_bit_exact: bool = False
     sidecars: list[SidecarPoolSpec] = field(default_factory=list)
     # Mamba state lives in req_to_token_pool, not in kvcache, so its
     # layer_transfer_counter has to be wired separately.
@@ -848,10 +851,27 @@ class _DeepSeekV4Strategy(StackStrategy):
                 PoolName.SWA
             )
 
+        swa_bit_exact = getattr(
+            kvcache, "_unified_kv", False
+        ) and envs.SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE.get()
+        if swa_bit_exact and server_args.hicache_write_policy != "write_through":
+            # Bit-exact needs the owning request to offload its true SWA window
+            # to host at insert time, while its per-request ring slot is still
+            # valid. write_back defers the ring->host copy to eviction time, by
+            # when the slot may have been recycled (stale bytes) -> silent
+            # non-bit-exact reuse. Fail loud instead.
+            raise ValueError(
+                "SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE requires "
+                "--hicache-write-policy write_through (got "
+                f"{server_args.hicache_write_policy!r}); write_back cannot "
+                "guarantee the SWA ring is offloaded before its slot is reused."
+            )
+
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools=component_host_pools,
+            swa_bit_exact=swa_bit_exact,
             sidecars=sidecars,
             transfer_layer_num=kvcache.end_layer - kvcache.start_layer,
             pools_desc="KV + SWA + DeepSeekV4 sidecars",
@@ -1245,6 +1265,9 @@ def _apply_stack_result(
         cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
         setattr(cache, cache_attr, host_pool)
         setattr(cache.components[ct], component_attr, host_pool)
+
+    if result.swa_bit_exact and ComponentType.SWA in cache.components:
+        cache.components[ComponentType.SWA]._strict_bit_exact = True
 
     for sidecar in result.sidecars:
         cache.register_sidecar_pool(sidecar)

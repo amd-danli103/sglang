@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import sys
 import threading
@@ -1407,6 +1408,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if comp is not None:
             comp.drive_host_eviction(num_tokens, tracker)
         return tracker[component_type]
+
+    def drive_host_leaf_eviction(
+        self,
+        num_tokens: int,
+        key_component: ComponentType,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Free host pool space by evicting whole host leaves atomically until
+        ``tracker[key_component] >= num_tokens``.
+
+        Unlike a component's private host eviction, this drops every component
+        on each evicted leaf together (via ``_evict_host_leaf``), so component
+        host copies (e.g. Full and SWA) keep bound lifetimes. Used by strict
+        bit-exact SWA so a Full-host copy never outlives its SWA-host copy.
+        Leaf-only eviction also respects the Full anchor invariant (a parent is
+        only ever freed after its children, as children collapse to leaves).
+        """
+        heap = [
+            (self.eviction_strategy.get_priority(n), n)
+            for n in self.evictable_host_leaves
+        ]
+        heapq.heapify(heap)
+        while tracker[key_component] < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x not in self.evictable_host_leaves:
+                continue
+            self._evict_host_leaf(x, tracker)
+            if x.parent is not None and x.parent in self.evictable_host_leaves:
+                heapq.heappush(
+                    heap,
+                    (self.eviction_strategy.get_priority(x.parent), x.parent),
+                )
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
         """D-leaf: Full device value present, no child with Full KV on device,
