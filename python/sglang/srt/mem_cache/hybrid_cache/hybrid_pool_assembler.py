@@ -286,18 +286,13 @@ def _dsv4_swa_ring_region_buffers(kvcache: Any) -> tuple[list, int]:
     """Resolve ``(device_buffers, item_bytes)`` for the unified_kv SWA ring.
 
     The SWA ring occupies rows ``[0, swa_pages)`` of every unified layer buffer
-    (``req_pool_idx * swa_window + pos % swa_window`` addressing). One host page
-    mirrors ``swa_page_size`` consecutive ring rows, matching how the SWA host
-    pool pages the device ring.
+    (``req_pool_idx * swa_ring_size + pos % swa_ring_size`` addressing). The host
+    pool pages the ring by sliding window: one host page mirrors one window
+    (``unified_swa_ring_size`` consecutive ring rows), so device rows match the
+    host ``item_bytes`` in transfer_kv.
     """
     assert getattr(kvcache, "_unified_kv", False)
-    swa_pages = kvcache.unified_kv_pool.swa_pages
-    row_bytes = kvcache.unified_kv_pool.kv_buffer[0][0].nbytes
-    buffers = [
-        buf.narrow(0, 0, swa_pages) for buf in kvcache.unified_kv_pool.kv_buffer
-    ]
-    item_bytes = kvcache.swa_page_size * row_bytes
-    return buffers, item_bytes
+    return kvcache.swa_region_buffers()
 
 
 # Default assumed average sequence length (tokens) of prefixes cached to host;
@@ -449,9 +444,9 @@ def build_deepseek_v4_hicache_stack(
         swa_ring_buffers, swa_item_bytes = _dsv4_swa_ring_region_buffers(kvcache)
         num_swa_layers = len(swa_ring_buffers)
         page_bytes = swa_item_bytes * num_swa_layers
-        device_ring_pages = (
-            kvcache.unified_kv_pool.swa_pages + kvcache.swa_page_size - 1
-        ) // kvcache.swa_page_size
+        # Page unit = one sliding window; the ring holds exactly num_slots windows.
+        swa_ring_size = kvcache.unified_swa_ring_size
+        device_ring_pages = kvcache.unified_kv_pool.swa_pages // swa_ring_size
         unified_swa_host_pages = _swa_host_num_pages(
             server_args=server_args,
             full_host_pages=num_host_pages,
@@ -472,7 +467,7 @@ def build_deepseek_v4_hicache_stack(
             device_buffers=swa_ring_buffers,
             item_bytes=swa_item_bytes,
             num_host_pages=unified_swa_host_pages,
-            slot_page_size=kvcache.swa_page_size,
+            slot_page_size=swa_ring_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )

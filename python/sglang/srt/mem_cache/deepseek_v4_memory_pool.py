@@ -779,6 +779,38 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         return views, item_bytes
 
+    def swa_region_buffers(self) -> Tuple[List[torch.Tensor], int]:
+        """
+        Page-granular views of the SWA ring region [0, swa_pages) of every
+        unified_kv layer, one indexed row per sliding-window page
+        (``unified_swa_ring_size`` consecutive ring rows). Mirrors
+        ``unified_region_buffers`` so the SWA host pool transfers a whole window
+        per page and device rows match the host ``item_bytes`` in transfer_kv.
+        """
+        assert self._unified_kv, "swa_region_buffers requires unified_kv layout"
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        head_dim = self.unified_kv_pool.head_dim
+        rows_per_page = self.unified_swa_ring_size
+        assert swa_pages % rows_per_page == 0, (
+            f"swa_pages {swa_pages} not a multiple of ring size {rows_per_page}"
+        )
+        num_pages = swa_pages // rows_per_page
+
+        views: List[torch.Tensor] = []
+        for buf in self.unified_kv_pool.kv_buffer:
+            page_view = (
+                buf.narrow(0, 0, swa_pages)
+                .reshape(num_pages, rows_per_page * head_dim)
+                .view(torch.uint8)
+            )
+            views.append(page_view)
+
+        item_bytes = (
+            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
+        )
+        return views, item_bytes
+
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []

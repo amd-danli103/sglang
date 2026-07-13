@@ -1,10 +1,11 @@
 """Pure-logic unit tests for the strict bit-exact SWA HiCache feature.
 
-Covers the three commits:
+Covers the strict bit-exact SWA HiCache logic:
   * sizing: hybrid_pool_assembler._swa_host_num_pages
   * co-eviction observability: UnifiedRadixCache._note_binding_full_coevict
   * strict atomic leaf eviction: UnifiedRadixCache.drive_host_leaf_eviction
     and SWAComponent.drive_host_eviction routing
+  * offload geometry: DeepSeekV4TokenToKVPool.swa_region_buffers page unit
 
 No GPU / model is required; heavy collaborators are faked so we exercise only
 the new logic. Run:
@@ -328,3 +329,143 @@ class TestWriteBackGuard(unittest.TestCase):
         self.assertNotIn(
             "requires --hicache-write-policy", str(ctx.exception)
         )
+
+
+class TestSwaRegionBuffers(unittest.TestCase):
+    """The SWA-ring host pool must be page-granular with the sliding window as
+    the page unit, so each indexed device row is exactly one host item_bytes.
+    Row-granular device buffers (head_dim rows) declared with a page-granular
+    item_bytes mismatch in transfer_kv_direct and crash."""
+
+    def _fake_pool(self, *, num_slots, ring_size, head_dim, compress_rows, layers):
+        import torch
+
+        swa_pages = num_slots * ring_size
+        rows = swa_pages + compress_rows
+        kv_buffer = [
+            torch.arange(rows * head_dim, dtype=torch.bfloat16).reshape(rows, head_dim)
+            for _ in range(layers)
+        ]
+        unified_kv_pool = types.SimpleNamespace(
+            swa_pages=swa_pages, head_dim=head_dim, kv_buffer=kv_buffer
+        )
+        return types.SimpleNamespace(
+            _unified_kv=True,
+            unified_swa_ring_size=ring_size,
+            unified_kv_pool=unified_kv_pool,
+        )
+
+    def test_page_granular_geometry(self):
+        import torch
+
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool as P,
+        )
+
+        ring_size, head_dim, num_slots, layers = 2, 4, 3, 2
+        pool = self._fake_pool(
+            num_slots=num_slots,
+            ring_size=ring_size,
+            head_dim=head_dim,
+            compress_rows=8,
+            layers=layers,
+        )
+        views, item_bytes = P.swa_region_buffers(pool)
+        # one page == one sliding window == ring_size rows (bf16 = 2 bytes).
+        self.assertEqual(item_bytes, ring_size * head_dim * 2)
+        self.assertEqual(len(views), layers)
+        for v in views:
+            self.assertEqual(v.dtype, torch.uint8)
+            # num_pages == swa_pages // ring_size == num_slots; row width == item_bytes.
+            self.assertEqual(v.shape, (num_slots, item_bytes))
+            self.assertEqual(v[0].nbytes, item_bytes)
+
+    def test_view_preserves_ring_data(self):
+        import torch
+
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool as P,
+        )
+
+        ring_size, head_dim = 2, 4
+        pool = self._fake_pool(
+            num_slots=3,
+            ring_size=ring_size,
+            head_dim=head_dim,
+            compress_rows=8,
+            layers=1,
+        )
+        views, _ = P.swa_region_buffers(pool)
+        buf = pool.unified_kv_pool.kv_buffer[0]
+        # host page 1 must be ring rows [ring_size, 2*ring_size) byte-identical.
+        expected = (
+            buf.narrow(0, ring_size, ring_size).reshape(-1).view(torch.uint8)
+        )
+        self.assertTrue(torch.equal(views[0][1], expected))
+
+    def test_rejects_non_unified(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool as P,
+        )
+
+        pool = types.SimpleNamespace(_unified_kv=False)
+        with self.assertRaises(AssertionError):
+            P.swa_region_buffers(pool)
+
+    def test_rejects_non_divisible_ring(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool as P,
+        )
+
+        # swa_pages must be a whole number of windows; a corrupt pool trips the guard.
+        pool = self._fake_pool(
+            num_slots=3, ring_size=2, head_dim=4, compress_rows=8, layers=1
+        )
+        pool.unified_kv_pool.swa_pages += 1  # 7, not a multiple of ring_size=2
+        with self.assertRaises(AssertionError):
+            P.swa_region_buffers(pool)
+
+    def test_all_pages_map_to_their_window(self):
+        import torch
+
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool as P,
+        )
+
+        ring_size, head_dim, num_slots = 2, 4, 5
+        pool = self._fake_pool(
+            num_slots=num_slots,
+            ring_size=ring_size,
+            head_dim=head_dim,
+            compress_rows=6,
+            layers=2,
+        )
+        views, _ = P.swa_region_buffers(pool)
+        for layer, view in enumerate(views):
+            buf = pool.unified_kv_pool.kv_buffer[layer]
+            self.assertEqual(view.shape[0], num_slots)  # one page per window
+            for page in range(num_slots):
+                # page p must be exactly ring rows [p*ring, (p+1)*ring), byte-identical.
+                expected = (
+                    buf.narrow(0, page * ring_size, ring_size)
+                    .reshape(-1)
+                    .view(torch.uint8)
+                )
+                self.assertTrue(torch.equal(view[page], expected))
+
+
+class TestSwaRingRegionDelegation(unittest.TestCase):
+    """The assembler seam must delegate SWA-ring buffer resolution to the pool
+    (which owns the unified_kv layout) and never re-derive geometry itself."""
+
+    def test_delegates_to_pool(self):
+        sentinel = (["buf0", "buf1"], 131072)
+        kvcache = types.SimpleNamespace(
+            _unified_kv=True, swa_region_buffers=lambda: sentinel
+        )
+        self.assertIs(A._dsv4_swa_ring_region_buffers(kvcache), sentinel)
+
+    def test_rejects_non_unified(self):
+        kvcache = types.SimpleNamespace(_unified_kv=False)
+        with self.assertRaises(AssertionError):
+            A._dsv4_swa_ring_region_buffers(kvcache)
