@@ -16,10 +16,14 @@ import math
 import types
 import unittest
 
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as A
 from sglang.srt.mem_cache import unified_radix_cache as R
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    CacheTransferPhase,
+)
 
 FULL = R.BASE_COMPONENT_TYPE
 SWA = ComponentType.SWA
@@ -469,3 +473,57 @@ class TestSwaRingRegionDelegation(unittest.TestCase):
         kvcache = types.SimpleNamespace(_unified_kv=False)
         with self.assertRaises(AssertionError):
             A._dsv4_swa_ring_region_buffers(kvcache)
+
+
+class TestStrictL2Only(unittest.TestCase):
+    """I4 (L2-only): strict bit-exact SWA HiCache keeps SWA values on the host
+    pool only. The BACKUP_STORAGE (L3) phase must emit no transfer in strict
+    mode -- even when the node carries a host_value that a non-strict build would
+    persist -- so a reused prefix can never restore an SWA window that has
+    outlived its Full-host lifetime coupling (which would force a non-bit-exact
+    tail re-prefill)."""
+
+    PAGE_SIZE = 256
+
+    def _comp(self, strict):
+        comp = types.SimpleNamespace()
+        comp._strict_bit_exact = strict
+        comp.component_type = SWA
+        # Non-None host pool so the device-only early return is skipped and we
+        # actually reach the BACKUP_STORAGE branch.
+        comp._swa_kv_pool_host = object()
+        comp.cache = types.SimpleNamespace(
+            cache_controller=object(), page_size=self.PAGE_SIZE
+        )
+        return comp
+
+    def _node_with_hostvalue(self):
+        # 2 trailing pages worth of host_value -> a non-strict build persists it.
+        cd = types.SimpleNamespace(
+            host_value=list(range(2 * self.PAGE_SIZE)), value=None
+        )
+        return types.SimpleNamespace(
+            component_data={SWA: cd}, hash_value=["h0", "h1"]
+        )
+
+    def _build_storage(self, comp, node):
+        return SWAComponent.build_hicache_transfers(
+            comp, node, CacheTransferPhase.BACKUP_STORAGE
+        )
+
+    def test_strict_emits_no_l3_transfer(self):
+        # The node would be persisted if not strict; strict must suppress it.
+        self.assertIsNone(
+            self._build_storage(self._comp(strict=True), self._node_with_hostvalue())
+        )
+
+    def test_non_strict_would_persist_to_l3(self):
+        # Proves the guard is the sole cause of suppression: identical node,
+        # strict off -> a trailing-pages L3 transfer IS produced.
+        transfers = self._build_storage(
+            self._comp(strict=False), self._node_with_hostvalue()
+        )
+        self.assertIsNotNone(transfers)
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(transfers[0].name, PoolName.SWA)
+        self.assertEqual(transfers[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)

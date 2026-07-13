@@ -678,6 +678,13 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.BACKUP_STORAGE:
+            # I4 (L2-only): strict bit-exact SWA HiCache keeps SWA values on the
+            # host pool only. Persisting them to the L3 storage backend would let
+            # a reused prefix restore an SWA window that is no longer coupled to
+            # its Full-host lifetime, breaking bit-exactness. Never emit an L3
+            # transfer in strict mode; this holds regardless of L3 config.
+            if self._strict_bit_exact:
+                return None
             cd = node.component_data[ct]
             if cd.host_value is None or not node.hash_value:
                 return None
