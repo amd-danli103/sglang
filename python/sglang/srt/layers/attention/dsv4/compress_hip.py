@@ -173,6 +173,96 @@ class CompressorHip(_CompressorBase):
             print(f"[sgl] {name}: shape={y.shape}, dtype={y.dtype}, device={y.device}")
             print(f"{y.flatten()[:10]}...{y.flatten()[-10:]}")
 
+    def _capture_compress_state_windows(
+        self,
+        kv_and_score_buffer,
+        valid_kv_len: int,
+        prefix_len: int,
+        extend_len: int,
+        rid: int,
+        backend,
+    ) -> None:
+        """Capture the c4 / c4-indexer overlap state ``[B-ratio, B)`` at each
+        page boundary ``B`` in this chunk into the strict-mode host state pool.
+
+        The device state ring is a small ``ring_size`` rolling buffer, so interior
+        boundary states are overwritten during chunked prefill; snapshot them
+        from ``kv_and_score_buffer`` (same object written to the ring) instead.
+        Each window token at sequence position ``s`` maps to ring offset
+        ``(s % swa_ring_size) % ring_size`` -- deterministic from ``s`` alone
+        because SWA pages align to ``ring_size`` -- so the reusing request lands
+        the restored state on the same slots. No-op unless the bit-exact host
+        state pool has been wired onto the device pool.
+        """
+        if self.ratio != 4:
+            return
+        token_to_kv_pool = backend.token_to_kv_pool
+        attr = (
+            "_c4_indexer_state_host_pool"
+            if self.is_in_indexer
+            else "_c4_state_host_pool"
+        )
+        hp = getattr(token_to_kv_pool, attr, None)
+        if hp is None:
+            return
+        layer_index = getattr(token_to_kv_pool, "_c4_state_layer_index", None)
+        if layer_index is None:
+            return
+        li = layer_index.get(self.layer_id)
+        if li is None:
+            return
+        if extend_len <= 0:
+            return
+
+        page = backend.page_size
+        swa_ring = token_to_kv_pool.unified_swa_ring_size
+        slot_page = hp.slot_page_size  # == ring_size
+        if swa_ring % slot_page != 0 or page % swa_ring != 0:
+            raise AssertionError(
+                f"state capture geometry: page={page} swa_ring={swa_ring} "
+                f"ring_size={slot_page}"
+            )
+        win = self.ratio  # compute_state_len(B, 4) == 4 at a page boundary
+        slot_bytes = hp.item_bytes // slot_page
+        staging = hp._capture_staging
+        state_buf = kv_and_score_buffer.kv_score
+        host_layer_buf = hp.data_refs[li]
+        pre_len = valid_kv_len - extend_len
+
+        cs = prefix_len
+        total = prefix_len + extend_len
+        boundary = (total // page) * page
+        B = ((cs // page) + 1) * page
+        while B <= boundary:
+            off0 = ((B - win) % swa_ring) % slot_page
+            if B - win < cs or off0 + win > slot_page:
+                raise AssertionError(
+                    f"state window out of range: B={B} win={win} cs={cs} "
+                    f"off0={off0} ring_size={slot_page}"
+                )
+            key = (rid, int(B))
+            hidx = staging.get(key)
+            if hidx is None:
+                hidx = hp.alloc(slot_page)
+                if hidx is None:
+                    B += page
+                    continue
+                staging[key] = hidx
+            buf_lo = pre_len + (B - win - prefix_len)
+            buf_hi = pre_len + (B - prefix_len)
+            win_slice = state_buf[buf_lo:buf_hi]
+            flat = win_slice.contiguous().view(torch.uint8).reshape(-1)
+            if flat.numel() != win * slot_bytes:
+                raise AssertionError(
+                    f"state window bytes {flat.numel()} != {win * slot_bytes}"
+                )
+            page_row = int(hidx[0].item()) // slot_page
+            dst = host_layer_buf[page_row]
+            dst[off0 * slot_bytes : off0 * slot_bytes + flat.numel()].copy_(
+                flat, non_blocking=True
+            )
+            B += page
+
     def compress_extend_paged(
         self,
         kv_and_scores: KVAndScore,
@@ -225,6 +315,21 @@ class CompressorHip(_CompressorBase):
             pre_kv_state = state_pool.get_state_by_state_loc(state_loc)
             kv_and_score_buffer = KVAndScore.cat([pre_kv_state, kv_and_score], dim=0)
             valid_kv_len = kv_and_score_buffer.kv.size(0)
+
+            # Strict SWA HiCache: snapshot the c4 / c4-indexer overlap state at
+            # each page boundary into the host state pool (no-op unless the pool
+            # is wired, i.e. the bit-exact flag is on). Captured before the
+            # in-place ape.add_ / overlap transform below; the [B-ratio, B)
+            # window lives in the uncompressed tail, byte-identical to what
+            # set_state_by_state_loc would persist.
+            self._capture_compress_state_windows(
+                kv_and_score_buffer=kv_and_score_buffer,
+                valid_kv_len=valid_kv_len,
+                prefix_len=int(prefix_lens[i]),
+                extend_len=int(extend_lens[i]),
+                rid=int(req_pool_indices[i]),
+                backend=backend,
+            )
 
             post_state_indices = self.compute_state_len_indices(
                 seq_len=prefix_lens[i] + extend_lens[i], ratio=self.ratio

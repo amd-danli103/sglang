@@ -278,6 +278,59 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     """
     if getattr(kvcache, "_unified_kv", False):
         return kvcache.unified_region_buffers(ratio)
+
+
+def _dsv4_unified_state_paged_pool(
+    pool_name: str,
+    state_pools: list,
+    num_host_pages: int,
+    layout: str,
+    allocator_type: str,
+):
+    """Build a paged host pool over a DeepSeek V4 compress-state ring for the
+    strict unified_kv path. One host page mirrors one device ring page
+    (``ring_size`` slots), so the capture / restore flow can reuse the SWA
+    DeepSeekV4PagedHostPool machinery (allocator + capture staging) verbatim.
+
+    Returns ``(host_pool, ring_size)``.
+    """
+    import torch
+
+    if any(pool is None for pool in state_pools):
+        raise ValueError(f"{pool_name} state_pools must not contain None")
+    device_buffers = []
+    item_bytes = None
+    ring_size = None
+    for pool in state_pools:
+        st = pool.kv_score_buffer.kv_score
+        if not st.is_contiguous():
+            raise ValueError(f"{pool_name} state tensor must be contiguous")
+        rs = pool.ring_size
+        slot_bytes = st[0].nbytes
+        page_bytes = rs * slot_bytes
+        usable = (st.shape[0] // rs) * rs
+        buf = (
+            st.view(torch.uint8)
+            .reshape(st.shape[0], -1)[:usable]
+            .reshape(-1, page_bytes)
+        )
+        device_buffers.append(buf)
+        if item_bytes is None:
+            item_bytes, ring_size = page_bytes, rs
+        elif item_bytes != page_bytes or ring_size != rs:
+            raise ValueError(
+                f"{pool_name} state pools must share ring size and slot bytes"
+            )
+    host_pool = DeepSeekV4PagedHostPool(
+        pool_name=pool_name,
+        device_buffers=device_buffers,
+        item_bytes=item_bytes,
+        num_host_pages=num_host_pages,
+        slot_page_size=ring_size,
+        layout=layout,
+        allocator_type=allocator_type,
+    )
+    return host_pool, ring_size
     pool = kvcache.c4_kv_pool if ratio == 4 else kvcache.c128_kv_pool
     return pool.kv_buffer, pool.bytes_per_page_padded
 
@@ -537,7 +590,65 @@ def build_deepseek_v4_hicache_stack(
             ]
         )
 
-        if not is_unified_kv:
+        if is_unified_kv and unified_swa_hicache:
+            # Strict bit-exact (unified_kv): the device C4 / C4-indexer state ring
+            # is a small ``ring_size`` rolling buffer, so interior page-boundary
+            # states are overwritten during chunked prefill (same reason SWA uses
+            # capture-from-flat, not device-ring backup). The stock
+            # DeepSeekV4StateHostPool has no allocator and reuses SWA transfer
+            # indices via the (C4_STATE, SWA) sidecar -- neither holds here. So
+            # mirror the SWA path: back the state ring with a paged host pool
+            # (allocator + capture staging), one host page == one ring page.
+            c4_state_host_pool, _c4_state_ring = _dsv4_unified_state_paged_pool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
+                state_pools=[
+                    kvcache.compress_state_pools[layer_id]
+                    for layer_id in c4_state_global_layers
+                ],
+                num_host_pages=swa_num_host_pages,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+            c4_indexer_state_host_pool, _c4_idx_ring = _dsv4_unified_state_paged_pool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+                state_pools=[
+                    kvcache.indexer_compress_state_pools[layer_id]
+                    for layer_id in c4_state_global_layers
+                ],
+                num_host_pages=swa_num_host_pages,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+            # Expose on the device kvcache so the compressor forward (state
+            # capture) and the state components (bind/restore) can reach them.
+            kvcache._c4_state_host_pool = c4_state_host_pool
+            kvcache._c4_indexer_state_host_pool = c4_indexer_state_host_pool
+            kvcache._c4_state_layer_index = dict(c4_state_mapping)
+            for _hp in (c4_state_host_pool, c4_indexer_state_host_pool):
+                if not hasattr(_hp, "_capture_staging"):
+                    _hp._capture_staging = {}
+                if not hasattr(_hp, "_capture_crc"):
+                    _hp._capture_crc = {}
+                    _hp._dbg_restore_verified = 0
+            entries.extend(
+                [
+                    build_pool_entry(
+                        name=PoolName.DEEPSEEK_V4_C4_STATE,
+                        host_pool=c4_state_host_pool,
+                        device_pool=None,
+                        layer_mapping=c4_state_mapping,
+                        transfer_layer_num=transfer_layer_num,
+                    ),
+                    build_pool_entry(
+                        name=PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                        host_pool=c4_indexer_state_host_pool,
+                        device_pool=None,
+                        layer_mapping=c4_state_mapping,
+                        transfer_layer_num=transfer_layer_num,
+                    ),
+                ]
+            )
+        elif not is_unified_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
                 state_pools=[
