@@ -179,9 +179,13 @@ class TestSwaBindWindow(unittest.TestCase):
             component_data={SWA: _cd(value=torch.arange(4), host_value=None)}
         )
         SWAComponent._bind_captured_swa_host(me, node, swa_start=0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(len(calls[0]), win)  # window (2), not node length (4)
-        self.assertTrue(torch.equal(calls[0], tile.to(torch.int64)))
+        # Co-lifetime: bind stashes a PENDING page (attached later, together with
+        # Full host_value, via the coordinated BACKUP_HOST), not host_value now.
+        pending = getattr(node, "_swa_pending_host", None)
+        self.assertIsNotNone(pending)
+        self.assertEqual(len(pending), win)  # window (2), not node length (4)
+        self.assertTrue(torch.equal(pending, tile.to(torch.int64)))
+        self.assertEqual(len(calls), 0)  # _attach deferred, not called at bind
         # tile consumed from staging
         self.assertNotIn((5, 4), host._capture_staging)
 
@@ -194,6 +198,7 @@ class TestSwaBindWindow(unittest.TestCase):
         )
         SWAComponent._bind_captured_swa_host(me, node, swa_start=0)
         self.assertEqual(calls, [])  # nothing bound
+        self.assertIsNone(getattr(node, "_swa_pending_host", None))
 
 
 class TestSwaRestoreWindowMapping(unittest.TestCase):

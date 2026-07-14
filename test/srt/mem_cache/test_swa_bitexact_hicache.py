@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
+    EvictLayer,
 )
 
 FULL = R.BASE_COMPONENT_TYPE
@@ -527,3 +528,79 @@ class TestStrictL2Only(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvictDeviceOnOwnerRelease(unittest.TestCase):
+    """SWAComponent.evict_device_on_owner_release: once the owning request has
+    finished (SWA lock_ref==0) and the host copy is committed, the per-request
+    device SWA ring value must be tombstoned so cross-request reuse restores
+    from host (I1) rather than trusting the recycled device ring. Gated so it
+    never fires while another request still holds the SWA lock (sanity_check
+    forbids value=None with lock_ref>0) and never destroys the only copy."""
+
+    def _node(self, *, value, host_value, lock_ref):
+        cd = types.SimpleNamespace(
+            value=value, host_value=host_value, lock_ref=lock_ref
+        )
+        return types.SimpleNamespace(component_data={SWA: cd}), cd
+
+    def _comp(self, *, strict=True, host_pool=object()):
+        comp = types.SimpleNamespace()
+        comp._strict_bit_exact = strict
+        comp._swa_kv_pool_host = host_pool
+        comp.component_type = SWA
+        calls = []
+
+        class _Cache:
+            def _evict_component_and_detach_lru(_s, node, c, target=None):
+                calls.append((node, c, target))
+
+        comp.cache = _Cache()
+        return comp, calls
+
+    def _run(self, comp, node):
+        SWAComponent.evict_device_on_owner_release(comp, node)
+
+    def test_released_and_backed_up_tombstones_device(self):
+        comp, calls = self._comp()
+        node, _ = self._node(value=[1, 2], host_value=[9], lock_ref=0)
+        self._run(comp, node)
+        self.assertEqual(len(calls), 1)
+        got_node, got_comp, target = calls[0]
+        self.assertIs(got_node, node)
+        self.assertIs(got_comp, comp)
+        self.assertEqual(target, EvictLayer.DEVICE)
+
+    def test_still_locked_is_left_intact(self):
+        # Another active request holds the SWA lock -> must not tombstone
+        # (device value=None with lock_ref>0 would trip sanity_check).
+        comp, calls = self._comp()
+        node, _ = self._node(value=[1, 2], host_value=[9], lock_ref=1)
+        self._run(comp, node)
+        self.assertEqual(calls, [])
+
+    def test_no_host_copy_is_left_intact(self):
+        # host_value not committed yet: dropping device now would force I6
+        # recompute AND (if only pending) risk co-lifetime races -> keep device.
+        comp, calls = self._comp()
+        node, _ = self._node(value=[1, 2], host_value=None, lock_ref=0)
+        self._run(comp, node)
+        self.assertEqual(calls, [])
+
+    def test_already_device_absent_is_noop(self):
+        comp, calls = self._comp()
+        node, _ = self._node(value=None, host_value=[9], lock_ref=0)
+        self._run(comp, node)
+        self.assertEqual(calls, [])
+
+    def test_non_strict_is_noop(self):
+        comp, calls = self._comp(strict=False)
+        node, _ = self._node(value=[1, 2], host_value=[9], lock_ref=0)
+        self._run(comp, node)
+        self.assertEqual(calls, [])
+
+    def test_feature_off_when_host_pool_unwired(self):
+        comp, calls = self._comp(host_pool=None)
+        node, _ = self._node(value=[1, 2], host_value=[9], lock_ref=0)
+        self._run(comp, node)
+        self.assertEqual(calls, [])

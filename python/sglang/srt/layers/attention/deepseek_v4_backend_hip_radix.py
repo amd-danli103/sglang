@@ -51,6 +51,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+import os as _os
+_SWA_DBG_CHECKSUM = _os.environ.get("SGLANG_SWA_DBG_CHECKSUM") == "1"
+
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
@@ -1434,10 +1437,20 @@ class DeepseekV4HipRadixBackend(
                     f"{host_pool.item_bytes}"
                 )
                 page_row = int(hidx[0].item()) // slot_page
-                host_layer_buf[page_row].copy_(
-                    win_slice.contiguous().view(torch.uint8).reshape(-1),
-                    non_blocking=True,
-                )
+                _flat = win_slice.contiguous().view(torch.uint8).reshape(-1)
+                host_layer_buf[page_row].copy_(_flat, non_blocking=True)
+                if _SWA_DBG_CHECKSUM:
+                    _crc_map = getattr(host_pool, "_capture_crc", None)
+                    if _crc_map is not None:
+                        _idx = (
+                            torch.arange(
+                                _flat.numel(), device=_flat.device, dtype=torch.int64
+                            )
+                            + 1
+                        )
+                        _crc_map[(rid, int(B), swa_layer)] = int(
+                            (_flat.to(torch.int64) * _idx).sum().item()
+                        )
                 B += page
             offset += e
 

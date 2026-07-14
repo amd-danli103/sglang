@@ -477,6 +477,9 @@ def build_deepseek_v4_hicache_stack(
         kvcache._swa_host_pool = swa_host_pool
         if not hasattr(swa_host_pool, "_capture_staging"):
             swa_host_pool._capture_staging = {}
+        if not hasattr(swa_host_pool, "_capture_crc"):
+            swa_host_pool._capture_crc = {}
+            swa_host_pool._dbg_restore_verified = 0
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
             build_pool_entry(

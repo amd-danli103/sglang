@@ -773,6 +773,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
+        # Strict SWA: the request is done — drop its per-request device SWA
+        # ring values along the finished prefix so any later cross-request
+        # reuse restores the true window from host (I1) rather than trusting
+        # the recycled device ring. Per-node gates (SWA lock_ref==0, host copy
+        # committed) are enforced inside evict_device_on_owner_release; nodes
+        # still held by another active request (lock_ref>0) are left intact.
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is not None:
+            node = req.last_node
+            while node is not None and node is not self.root_node:
+                swa_comp.evict_device_on_owner_release(node)
+                node = node.parent
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
@@ -1631,7 +1644,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if evicted < needed:
                 return 0
 
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers = [
+            x
+            for xfers in comp_xfers.values()
+            for x in xfers
+            if x.device_indices is not None
+        ]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None

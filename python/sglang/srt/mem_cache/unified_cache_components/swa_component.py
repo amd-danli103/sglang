@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
+
+logger = logging.getLogger(__name__)
+_SWA_DBG_CHECKSUM = os.environ.get("SGLANG_SWA_DBG_CHECKSUM") == "1"
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -416,6 +421,13 @@ class SWAComponent(TreeComponent):
             freed = len(cd.value)
             self.cache.component_evictable_size_[ct] -= freed
             cd.value = None
+            # Co-lifetime: a captured page not yet promoted to host_value must
+            # not outlive its device SWA; free it (node degrades to recompute).
+            pending = getattr(node, "_swa_pending_host", None)
+            if pending is not None:
+                if self._swa_kv_pool_host is not None:
+                    self._swa_kv_pool_host.free(pending)
+                node._swa_pending_host = None
 
         # Host layer
         host_lru = self.cache.host_lru_lists[ct]
@@ -437,6 +449,39 @@ class SWAComponent(TreeComponent):
                 host_lru.insert_mru(node)
 
         return freed, host_freed
+
+    def evict_device_on_owner_release(self, node: UnifiedTreeNode) -> None:
+        """Strict bit-exact: drop a node's per-request device SWA ring value
+        once its owning request has finished and no other request holds the
+        SWA lock, so cross-request reuse restores the true window from host
+        (I1) instead of trusting the device ring.
+
+        The device SWA lives in a per-request ring (``req_slot*ring +
+        pos%ring``) that is overwritten as the owner decodes and is recycled
+        when the owner's ``req_pool_idx`` is reused. Its bytes are therefore
+        only valid for the owning request's live window, never for a later
+        cross-request reuse. Called from ``cache_finished_req`` after the owner
+        released its lock: at that point the ring slots still belong to the
+        finishing request (safe to free, no aliasing with any live window),
+        and the host copy is the durable truth source.
+
+        Gates (all required for safety / sanity_check):
+          - strict mode + SWA host pool wired (feature on);
+          - device value present;
+          - ``host_value`` committed (keep the host copy so reuse restores it;
+            a pending-only page is left until its coordinated BACKUP_HOST
+            commits, avoiding co-lifetime races);
+          - SWA ``lock_ref == 0`` (no other active holder — required, else
+            sanity_check flags "evicted but lock_ref>0").
+        """
+        if not self._strict_bit_exact or self._swa_kv_pool_host is None:
+            return
+        cd = node.component_data[self.component_type]
+        if cd.value is None or cd.host_value is None or cd.lock_ref > 0:
+            return
+        self.cache._evict_component_and_detach_lru(
+            node, self, target=EvictLayer.DEVICE
+        )
 
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
@@ -639,14 +684,17 @@ class SWAComponent(TreeComponent):
     def _bind_captured_swa_host(
         self, node: UnifiedTreeNode, swa_start: int
     ) -> None:
-        """Set the node's SWA host_value from the prefill-captured host page
-        instead of backing up the (possibly stale) device ring.
+        """Stash the prefill-captured host page as a PENDING ref on the node.
 
-        The node ends at page boundary B; its SWA host copy is the single
-        captured window [B-win, B) keyed (rid, B), not the node's full value.
-        If that window was not captured (host pool full, or it fell outside this
-        chunk), leave host_value None so the node falls back to the normal
-        backup / recompute path.
+        Co-lifetime (I3): the SWA host_value must not exist before the node's
+        Full host_value. So we do NOT set host_value here; we attach it later
+        through the coordinated BACKUP_HOST commit (which runs together with the
+        Full host backup). Until then the page is held in ``node._swa_pending_host``
+        and is freed on device eviction if the node is never backed up.
+
+        The node ends at page boundary B; its captured window is [B-win, B) keyed
+        (rid, B). If it was not captured (host pool full / outside this chunk),
+        leave the node to the normal backup / recompute path.
         """
         hp = self._swa_kv_pool_host
         if hp is None:
@@ -671,7 +719,16 @@ class SWAComponent(TreeComponent):
         if len(host_value) != win:
             hp.free(host_value)
             return
-        self._attach_swa_host_value(node, host_value)
+        # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
+        node._swa_pending_host = host_value
+        if _SWA_DBG_CHECKSUM:
+            crc_map = getattr(hp, "_capture_crc", None)
+            if crc_map:
+                keys = [
+                    k for k in crc_map if k[0] == rid and k[1] == int(node_end)
+                ]
+                if keys:
+                    cd.metadata["dbg_swa_crc"] = {k[2]: crc_map.pop(k) for k in keys}
 
     def cleanup_after_caching_req(
         self,
@@ -693,6 +750,11 @@ class SWAComponent(TreeComponent):
         leftover = [k for k in staging if k[0] == rid]
         for k in leftover:
             hp.free(staging.pop(k))
+        if _SWA_DBG_CHECKSUM:
+            crc_map = getattr(hp, "_capture_crc", None)
+            if crc_map:
+                for k in [k for k in crc_map if k[0] == rid]:
+                    crc_map.pop(k, None)
 
     def build_hicache_transfers(
         self,
@@ -715,11 +777,31 @@ class SWAComponent(TreeComponent):
             if cd.value is None:
                 return None
             if cd.host_value is not None:
-                # Already populated from prefill capture or a prior backup;
-                # do not re-copy the (possibly stale) device ring.
+                # Already populated from a prior backup; do not re-copy.
                 return None
+            pending = getattr(node, "_swa_pending_host", None)
+            if pending is not None:
+                # Co-lifetime: adopt the prefill-captured host page (already on
+                # host) through the coordinated backup, so SWA host_value is set
+                # together with Full host_value (never before). device_indices is
+                # None -> write_backup skips the (redundant) device->host copy.
+                return [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        host_indices=pending,
+                        device_indices=None,
+                    )
+                ]
+            if self._strict_bit_exact:
+                # Strict: SWA host pages are allocated only at prefill capture
+                # time. With no captured page (host pool full / window missed),
+                # emit no SWA host_value; the node falls back to recompute on
+                # reuse (I6). Never back up the device ring here -- it holds only
+                # the latest window per slot (older windows byte-stale) and
+                # allocating host at backup can exhaust the small SWA pool.
+                return None
+            # Best-effort: back up the device ring.
             # cd.value already holds SWA-pool indices (translated at insert time).
-            # Host pool indexing wants int64.
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
@@ -825,7 +907,14 @@ class SWAComponent(TreeComponent):
             if transfers and transfers[0].host_indices is not None:
                 cd = node.component_data[ct]
                 if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+                    # Same bookkeeping the eager insert path used (host_value +
+                    # evictable-leaf sets); host-LRU insert is deferred to the
+                    # device tombstone (cd.value is still set here).
+                    self._attach_swa_host_value(node, transfers[0].host_indices)
+                if transfers[0].device_indices is None:
+                    # Adopted the pre-staged capture page; ownership now held by
+                    # host_value (same page) -> drop the pending ref.
+                    node._swa_pending_host = None
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -850,6 +939,8 @@ class SWAComponent(TreeComponent):
                 assert cd_full_n.value is not None and len(cd_full_n.value) >= n_tokens
                 window_full = cd_full_n.value[-n_tokens:]
                 allocator.set_full_to_swa_mapping(window_full, swa_chunk)
+                if _SWA_DBG_CHECKSUM and hasattr(self, "_dbg_verify_restore"):
+                    self._dbg_verify_restore(cd_n)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
             return
@@ -862,6 +953,33 @@ class SWAComponent(TreeComponent):
                 pool_storage_result=pool_storage_result,
             )
             return
+
+    def _dbg_verify_restore(self, cd_n) -> None:
+        """TEMP (SGLANG_SWA_DBG_CHECKSUM): assert the bound host page still
+        matches the checksum captured at prefill, proving the restore path
+        served byte-exact windows. Immune to model non-determinism."""
+        hp = self._swa_kv_pool_host
+        crcs = (cd_n.metadata or {}).get("dbg_swa_crc")
+        if hp is None or not crcs or cd_n.host_value is None:
+            return
+        slot_page = hp.slot_page_size
+        page_row = int(cd_n.host_value[0].item()) // slot_page
+        for layer, expected in crcs.items():
+            b = hp.data_refs[layer][page_row].view(torch.uint8).reshape(-1)
+            idx = torch.arange(b.numel(), device=b.device, dtype=torch.int64) + 1
+            got = int((b.to(torch.int64) * idx).sum().item())
+            assert got == expected, (
+                f"[SWA-DBG] restore checksum mismatch layer={layer} "
+                f"page_row={page_row} expected={expected} got={got}"
+            )
+        hp._dbg_restore_verified = getattr(hp, "_dbg_restore_verified", 0) + 1
+        n = hp._dbg_restore_verified
+        if n <= 5 or n % 50 == 0:
+            logger.warning(
+                "[SWA-DBG] restore verified bit-exact: %d windows (layers/window=%d)",
+                n,
+                len(crcs),
+            )
 
     def _release_swa_host(self, host_indices: torch.Tensor) -> None:
         if host_indices is not None and host_indices.numel() > 0:
