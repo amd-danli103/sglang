@@ -218,6 +218,9 @@ class TestSwaRestoreWindowMapping(unittest.TestCase):
             cache=types.SimpleNamespace(token_to_kv_pool_allocator=allocator),
             _restore_device_value=lambda n, v: restore_calls.append(v.clone()),
         )
+        me._gather_window_full_indices = (
+            lambda n, nt: SWAComponent._gather_window_full_indices(me, n, nt)
+        )
         # node: full value length 4 (page node), SWA host_value == window (2)
         full_val = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
         node = types.SimpleNamespace(
@@ -240,6 +243,72 @@ class TestSwaRestoreWindowMapping(unittest.TestCase):
         mapped_full, mapped_swa = mapping_calls[0]
         # only the LAST win (=2) full indices [102,103] are mapped
         self.assertTrue(torch.equal(mapped_full, full_val[-win:]))
+        self.assertTrue(torch.equal(mapped_swa, device_indices))
+        self.assertEqual(len(restore_calls), 1)
+        self.assertTrue(torch.equal(restore_calls[0], device_indices))
+
+
+class TestSwaRestoreSplitWindow(unittest.TestCase):
+    """R.1 (Phase 4-prime.R): after a node split, a child shorter than the
+    sliding window still owns the whole window host_value [B-win, B). Restore
+    must gather the window full indices across the child AND its ancestors (in
+    token order), not just the child own (shorter) full value. Regression for
+    the set_full_to_swa_mapping length-mismatch assert."""
+
+    def test_window_spans_parent_and_child(self):
+        mapping_calls = []
+        restore_calls = []
+        allocator = types.SimpleNamespace(
+            set_full_to_swa_mapping=lambda full, swa: mapping_calls.append(
+                (full.clone(), swa.clone())
+            )
+        )
+        root = types.SimpleNamespace(component_data={}, parent=None)
+        me = types.SimpleNamespace(
+            component_type=SWA,
+            cache=types.SimpleNamespace(
+                token_to_kv_pool_allocator=allocator, root_node=root
+            ),
+            _restore_device_value=lambda n, v: restore_calls.append(v.clone()),
+        )
+        me._gather_window_full_indices = (
+            lambda n, nt: SWAComponent._gather_window_full_indices(me, n, nt)
+        )
+        # parent holds full tokens [B-4, B-2); child holds [B-2, B). The child
+        # keeps the whole win=4 window host_value (parent.host_value is None
+        # after redistribute_on_node_split).
+        parent = types.SimpleNamespace(
+            parent=root,
+            component_data={
+                SWA: _cd(value=None, host_value=None),
+                FULL: _cd(value=torch.tensor([100, 101], dtype=torch.int64)),
+            },
+        )
+        child = types.SimpleNamespace(
+            parent=parent,
+            component_data={
+                SWA: _cd(value=None, host_value=torch.tensor([0, 0, 0, 0])),
+                FULL: _cd(value=torch.tensor([102, 103], dtype=torch.int64)),
+            },
+        )
+        device_indices = torch.tensor([700, 701, 702, 703], dtype=torch.int64)
+        xfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.tensor([0, 0, 0, 0]),
+            device_indices=device_indices,
+            nodes_to_load=[child],
+        )
+        SWAComponent.commit_hicache_transfer(
+            me, child, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+        self.assertEqual(len(mapping_calls), 1)
+        mapped_full, mapped_swa = mapping_calls[0]
+        # window full indices, token order: parent tail [100,101] ++ child [102,103]
+        self.assertTrue(
+            torch.equal(
+                mapped_full, torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+            )
+        )
         self.assertTrue(torch.equal(mapped_swa, device_indices))
         self.assertEqual(len(restore_calls), 1)
         self.assertTrue(torch.equal(restore_calls[0], device_indices))

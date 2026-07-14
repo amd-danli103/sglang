@@ -926,19 +926,22 @@ class SWAComponent(TreeComponent):
             offset = 0
             for n in xfer.nodes_to_load or []:
                 cd_n = n.component_data[ct]
-                cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
                 n_tokens = len(cd_n.host_value)
                 swa_chunk = device_indices[offset : offset + n_tokens].clone()
                 self._restore_device_value(n, swa_chunk)
-                # host_value may hold only the sliding window [B-n_tokens, B),
-                # shorter than the node's full value. Map the window's (last
-                # n_tokens) full indices to the restored SWA slots; out-of-window
-                # full tokens keep sentinel 0 (never read under the SWA mask).
-                # When host_value spans the whole node, value[-n_tokens:] ==
-                # value, so this matches the previous behaviour.
-                assert cd_full_n.value is not None and len(cd_full_n.value) >= n_tokens
-                window_full = cd_full_n.value[-n_tokens:]
-                allocator.set_full_to_swa_mapping(window_full, swa_chunk)
+                # host_value holds the sliding window [B-n_tokens, B). Map its
+                # full indices to the restored SWA slots (out-of-window full
+                # tokens keep sentinel 0, never read under the SWA mask). The
+                # window may extend before this node own start when the node was
+                # split shorter than the window (its host_value still spans the
+                # whole window); gather the window full indices across the node
+                # and its ancestors, in token order, so full<->swa lengths
+                # match. In the common (unsplit) case the node own full value
+                # already has >= n_tokens and no ancestor is touched.
+                window_full = self._gather_window_full_indices(n, n_tokens)
+                allocator.set_full_to_swa_mapping(
+                    window_full, swa_chunk[-window_full.numel() :]
+                )
                 if _SWA_DBG_CHECKSUM and hasattr(self, "_dbg_verify_restore"):
                     self._dbg_verify_restore(cd_n)
                 offset += n_tokens
@@ -953,6 +956,31 @@ class SWAComponent(TreeComponent):
                 pool_storage_result=pool_storage_result,
             )
             return
+
+    def _gather_window_full_indices(
+        self, node: UnifiedTreeNode, n_tokens: int
+    ) -> torch.Tensor:
+        """Collect the last n_tokens FULL indices ending at node boundary, in
+        token order, walking into ancestors when the node own full value is
+        shorter than the sliding window (post-split case). In the common case
+        the node own full value already has >= n_tokens, so this returns
+        full.value[-n_tokens:] without touching any ancestor."""
+        parts = []
+        need = n_tokens
+        cur = node
+        root = getattr(self.cache, "root_node", None)
+        while need > 0 and cur is not None and cur is not root:
+            fv = cur.component_data[BASE_COMPONENT_TYPE].value
+            if fv is None or len(fv) == 0:
+                break
+            take = min(need, len(fv))
+            parts.append(fv[len(fv) - take :])
+            need -= take
+            if need <= 0:
+                break
+            cur = getattr(cur, "parent", None)
+        assert parts, "no FULL indices available to restore SWA window"
+        return torch.cat(list(reversed(parts)))
 
     def _dbg_verify_restore(self, cd_n) -> None:
         """TEMP (SGLANG_SWA_DBG_CHECKSUM): assert the bound host page still
