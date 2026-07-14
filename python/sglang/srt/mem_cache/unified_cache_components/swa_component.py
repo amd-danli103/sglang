@@ -44,6 +44,98 @@ if TYPE_CHECKING:
     )
 
 
+def _state_rides(comp):
+    """(host_pool, device_state_pools, pending_attr, host_value_attr) for each
+    enabled compress-state pool that rides an SWA node. Empty unless strict
+    bit-exact wired the c4 state pools (non-DSv4 / flag-off / test fake)."""
+    if getattr(comp, "_c4_state_layer_index", None) is None:
+        return []
+    rides = []
+    if getattr(comp, "_c4_state_host_pool", None) is not None:
+        rides.append(
+            (
+                comp._c4_state_host_pool,
+                comp._compress_state_pools,
+                "_c4_state_pending_host",
+                "_c4_state_host_value",
+            )
+        )
+    if getattr(comp, "_c4_indexer_state_host_pool", None) is not None:
+        rides.append(
+            (
+                comp._c4_indexer_state_host_pool,
+                comp._indexer_compress_state_pools,
+                "_c4_indexer_state_pending_host",
+                "_c4_indexer_state_host_value",
+            )
+        )
+    return rides
+
+
+def _free_state_bindings(comp, node, which: str) -> None:
+    """Free a node's ridden state pages. which in {pending, host, both}."""
+    for hp, _dev, pending_attr, hv_attr in _state_rides(comp):
+        if which in ("pending", "both"):
+            pend = getattr(node, pending_attr, None)
+            if pend is not None:
+                hp.free(pend)
+                setattr(node, pending_attr, None)
+        if which in ("host", "both"):
+            hv = getattr(node, hv_attr, None)
+            if hv is not None:
+                hp.free(hv)
+                setattr(node, hv_attr, None)
+
+
+def _promote_state_pending(comp, node) -> None:
+    """Adopt each ridden state pending page as its host_value, coupled to the
+    SWA/Full coordinated BACKUP_HOST (co-lifetime)."""
+    for _hp, _dev, pending_attr, hv_attr in _state_rides(comp):
+        pend = getattr(node, pending_attr, None)
+        if pend is not None:
+            if getattr(node, hv_attr, None) is None:
+                setattr(node, hv_attr, pend)
+            setattr(node, pending_attr, None)
+
+
+def _restore_state_windows(comp, node, swa_chunk) -> None:
+    """LOAD_BACK: write the ridden c4 / c4-indexer overlap state back into the
+    device state ring at translate_from_swa_loc_to_state_loc(restored swa slots).
+    No-op unless the node carries ridden state host pages.
+
+    Each captured window token sits at host ring offset ``swa_loc % ring``
+    (deterministic from position; see the compressor capture), so gather by the
+    restored slots' offsets and scatter to their state locs -- config
+    independent (no dependence on the 4..7 layout)."""
+    rides = _state_rides(comp)
+    if not rides:
+        return
+    layer_index = comp._c4_state_layer_index
+    for hp, dev_pools, _pending_attr, hv_attr in rides:
+        hv = getattr(node, hv_attr, None)
+        if hv is None:
+            continue
+        slot_page = hp.slot_page_size
+        page_row = int(hv[0].item()) // slot_page
+        first_pool = dev_pools[next(iter(layer_index))]
+        ratio = first_pool.ratio
+        if swa_chunk.numel() < ratio:
+            continue
+        swa_win = swa_chunk[-ratio:]
+        offsets = (swa_win % slot_page).to("cpu")
+        for gl, li in layer_index.items():
+            sp = dev_pools[gl]
+            dev = sp.kv_score_buffer.kv_score
+            state_locs = sp.translate_from_swa_loc_to_state_loc(swa_win)
+            host_view = (
+                hp.data_refs[li][page_row]
+                .view(dev.dtype)
+                .reshape(slot_page, dev.shape[1])
+            )
+            window = host_view[offsets].to(dev.device)
+            dev[state_locs.to(dev.device)] = window
+
+
 class SWAComponent(TreeComponent):
     """Sliding window attention component.
 
@@ -72,6 +164,14 @@ class SWAComponent(TreeComponent):
         # req_pool_idx of the request currently being cached; used to look up
         # its prefill-captured SWA host pages during insert.
         self._capture_rid = None
+        # Strict bit-exact: c4 / c4-indexer compress-state pages ride the SWA
+        # node (captured at prefill, restored on reuse). Wired at pool-attach
+        # time; None keeps all state logic a no-op (non-DSv4 / flag off).
+        self._c4_state_host_pool = None
+        self._c4_indexer_state_host_pool = None
+        self._c4_state_layer_index = None
+        self._compress_state_pools = None
+        self._indexer_compress_state_pools = None
 
     component_type = ComponentType.SWA
 
@@ -443,6 +543,8 @@ class SWAComponent(TreeComponent):
                 if self._swa_kv_pool_host is not None:
                     self._swa_kv_pool_host.free(pending)
                 node._swa_pending_host = None
+            # Ridden c4-state pending co-lives with SWA pending: free together.
+            _free_state_bindings(self, node, "pending")
 
         # Host layer
         host_lru = self.cache.host_lru_lists[ct]
@@ -453,6 +555,8 @@ class SWAComponent(TreeComponent):
             cd.host_value = None
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
+            # Ridden c4-state host_value co-lives with SWA host_value.
+            _free_state_bindings(self, node, "host")
 
         # After device tombstone: if host_value remains, move into host LRU
         if (
@@ -734,8 +838,29 @@ class SWAComponent(TreeComponent):
         if len(host_value) != win:
             hp.free(host_value)
             return
+        # Atomic co-lifetime across {SWA, c4-state, indexer-state}: bind only if
+        # every enabled ridden state window for this boundary was also captured.
+        # If any is missing, free everything so the node degrades to recompute --
+        # a reused SWA window without its exact c4 pre-state would read stale
+        # state and break bit-exactness.
+        rides = _state_rides(self)
+        state_tiles = []
+        atomic_ok = True
+        for shp, _dev, pending_attr, _hv in rides:
+            sh = shp._capture_staging.pop((rid, int(node_end)), None)
+            state_tiles.append((shp, pending_attr, sh))
+            if sh is None:
+                atomic_ok = False
+        if not atomic_ok:
+            for shp, _pa, sh in state_tiles:
+                if sh is not None:
+                    shp.free(sh)
+            hp.free(host_value)
+            return
         # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
         node._swa_pending_host = host_value
+        for _shp, pending_attr, sh in state_tiles:
+            setattr(node, pending_attr, sh)
         if _SWA_DBG_CHECKSUM:
             crc_map = getattr(hp, "_capture_crc", None)
             if crc_map:
@@ -765,6 +890,13 @@ class SWAComponent(TreeComponent):
         leftover = [k for k in staging if k[0] == rid]
         for k in leftover:
             hp.free(staging.pop(k))
+        # Release any ridden state capture staging this request never claimed.
+        for shp, _dev, _pa, _hv in _state_rides(self):
+            sstage = getattr(shp, "_capture_staging", None)
+            if not sstage:
+                continue
+            for k in [k for k in sstage if k[0] == rid]:
+                shp.free(sstage.pop(k))
         if _SWA_DBG_CHECKSUM:
             crc_map = getattr(hp, "_capture_crc", None)
             if crc_map:
@@ -930,6 +1062,8 @@ class SWAComponent(TreeComponent):
                     # Adopted the pre-staged capture page; ownership now held by
                     # host_value (same page) -> drop the pending ref.
                     node._swa_pending_host = None
+                    # Adopt the ridden c4-state pages together (co-lifetime).
+                    _promote_state_pending(self, node)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -957,6 +1091,9 @@ class SWAComponent(TreeComponent):
                 allocator.set_full_to_swa_mapping(
                     window_full, swa_chunk[-window_full.numel() :]
                 )
+                # Restore the ridden c4 / c4-indexer overlap state onto the
+                # device state ring at the freshly restored SWA slots.
+                _restore_state_windows(self, n, swa_chunk)
                 if _SWA_DBG_CHECKSUM and hasattr(self, "_dbg_verify_restore"):
                     self._dbg_verify_restore(cd_n)
                 offset += n_tokens

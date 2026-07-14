@@ -1427,7 +1427,23 @@ def _apply_stack_result(
         setattr(cache.components[ct], component_attr, host_pool)
 
     if result.swa_bit_exact and ComponentType.SWA in cache.components:
-        cache.components[ComponentType.SWA]._strict_bit_exact = True
+        swa_comp = cache.components[ComponentType.SWA]
+        swa_comp._strict_bit_exact = True
+        # Wire the c4 / c4-indexer compress-state pools that ride the SWA node
+        # (capture at prefill, restore on reuse). Absent -> state logic no-ops.
+        swa_comp._c4_state_host_pool = getattr(kvcache, "_c4_state_host_pool", None)
+        swa_comp._c4_indexer_state_host_pool = getattr(
+            kvcache, "_c4_indexer_state_host_pool", None
+        )
+        swa_comp._c4_state_layer_index = getattr(
+            kvcache, "_c4_state_layer_index", None
+        )
+        swa_comp._compress_state_pools = getattr(
+            kvcache, "compress_state_pools", None
+        )
+        swa_comp._indexer_compress_state_pools = getattr(
+            kvcache, "indexer_compress_state_pools", None
+        )
 
     for sidecar in result.sidecars:
         cache.register_sidecar_pool(sidecar)

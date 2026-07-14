@@ -19,8 +19,12 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.dsv4.compress_hip import CompressorHip
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.unified_cache_components import swa_component as SC
 
 _CAPTURE = CompressorHip._capture_compress_state_windows
+_RESTORE = SC._restore_state_windows
+_TRANSLATE = CompressStatePool.translate_from_swa_loc_to_state_loc
 
 
 def _fake_host_pool(*, ring_size, slot_bytes, num_pages):
@@ -142,6 +146,102 @@ class TestCompressStateCapture(unittest.TestCase):
             prefix_len=0, extend_len=256, is_indexer=True
         )
         self.assertEqual(set(hp._capture_staging), {(7, 256)})
+
+
+class TestCaptureRestoreRoundTrip(unittest.TestCase):
+    """End-to-end (real capture + real restore + real translate): the state
+    restored onto the device ring at the reuse boundary is byte-identical to the
+    compressor buffer window captured at prefill, independent of the actual SWA
+    slot offsets used by the reusing request."""
+
+    def test_roundtrip_byte_exact(self):
+        page, swa_ring, ring_size, ratio = 256, 128, 8, 4
+        last_dim, dtype = 16, torch.bfloat16
+        slot_bytes = last_dim * torch.tensor([], dtype=dtype).element_size()
+
+        # --- capture (original request, rid=7, prefill [0, 256)) ---
+        hp = _fake_host_pool(ring_size=ring_size, slot_bytes=slot_bytes, num_pages=8)
+        backend = _fake_backend(hp, page=page, swa_ring=swa_ring)
+        valid_kv_len = 256
+        buf = types.SimpleNamespace(
+            kv_score=torch.randint(0, 255, (valid_kv_len, last_dim), dtype=torch.int32)
+            .to(dtype)
+        )
+        _CAPTURE(
+            _fake_self(),
+            kv_and_score_buffer=buf,
+            valid_kv_len=valid_kv_len,
+            prefix_len=0,
+            extend_len=256,
+            rid=7,
+            backend=backend,
+        )
+        host_indices = hp._capture_staging[(7, 256)]
+
+        # --- restore (reusing request): its window [128, 256) got restored SWA
+        # slots swa_chunk; the last `ratio` are [B-ratio, B). Use a swa_base that
+        # is a multiple of swa_ring (as real SWA pages are) but different from
+        # capture, to prove offset independence. ---
+        swa_base = 256
+        swa_chunk = torch.arange(swa_base, swa_base + swa_ring, dtype=torch.int64)
+
+        dev = torch.zeros((64, last_dim), dtype=dtype)
+        fake_sp = types.SimpleNamespace(
+            ring_size=ring_size,
+            swa_page_size=swa_ring,
+            ratio=ratio,
+            kv_score_buffer=types.SimpleNamespace(kv_score=dev),
+        )
+        fake_sp.translate_from_swa_loc_to_state_loc = types.MethodType(
+            _TRANSLATE, fake_sp
+        )
+        node = types.SimpleNamespace(
+            _c4_state_host_value=host_indices,
+            _c4_indexer_state_host_value=None,
+        )
+        restorer = types.SimpleNamespace(
+            _c4_state_layer_index={0: 0},
+            _c4_state_host_pool=hp,
+            _c4_indexer_state_host_pool=None,
+            _compress_state_pools=[fake_sp],
+            _indexer_compress_state_pools=None,
+        )
+        _RESTORE(restorer, node, swa_chunk)
+
+        # device ring slots for [B-ratio, B) == captured buffer window
+        state_locs = _TRANSLATE(fake_sp, swa_chunk[-ratio:])
+        got = dev[state_locs]
+        want = buf.kv_score[valid_kv_len - ratio : valid_kv_len]
+        self.assertTrue(torch.equal(got, want))
+
+    def test_restore_noop_without_host_value(self):
+        dev = torch.zeros((16, 8), dtype=torch.bfloat16)
+        fake_sp = types.SimpleNamespace(
+            ring_size=8, swa_page_size=128, ratio=4,
+            kv_score_buffer=types.SimpleNamespace(kv_score=dev),
+        )
+        node = types.SimpleNamespace(
+            _c4_state_host_value=None, _c4_indexer_state_host_value=None
+        )
+        restorer = types.SimpleNamespace(
+            _c4_state_layer_index={0: 0},
+            _c4_state_host_pool=types.SimpleNamespace(slot_page_size=8, data_refs=[]),
+            _c4_indexer_state_host_pool=None,
+            _compress_state_pools=[fake_sp],
+            _indexer_compress_state_pools=None,
+        )
+        _RESTORE(restorer, node, torch.arange(128))  # must not raise / touch dev
+        self.assertTrue(torch.equal(dev, torch.zeros_like(dev)))
+
+    def test_active_rides_empty_when_unwired(self):
+        restorer = types.SimpleNamespace(
+            _c4_state_layer_index=None,
+            _c4_state_host_pool=None,
+            _c4_indexer_state_host_pool=None,
+            _compress_state_pools=None,
+            _indexer_compress_state_pools=None,
+        )
+        self.assertEqual(SC._state_rides(restorer), [])
 
 
 if __name__ == "__main__":
