@@ -314,5 +314,51 @@ class TestSwaRestoreSplitWindow(unittest.TestCase):
         self.assertTrue(torch.equal(restore_calls[0], device_indices))
 
 
+class TestStrictMatchValidatorI2Prime(unittest.TestCase):
+    """R.6 / I2-prime: in strict mode a node whose SWA truth lives only in the
+    per-request device ring (cd.value present, host_value None) must NOT extend
+    a reuse match. The device ring is recycled across requests and is not a
+    durable cross-request truth; the match must truncate so reuse restores from
+    host or recomputes (I6). Best-effort (non-strict) keeps trusting device."""
+
+    def _validator(self, strict):
+        me = types.SimpleNamespace(
+            sliding_window_size=4,
+            component_type=SWA,
+            _swa_kv_pool_host=object(),  # host pool wired => feature on, not device-only
+            _strict_bit_exact=strict,
+            cache=types.SimpleNamespace(cache_controller=object()),
+        )
+        return SWAComponent.create_match_validator(me)
+
+    def _node(self, key_len, value, host_value):
+        return types.SimpleNamespace(
+            key=list(range(key_len)),
+            backuped=True,
+            evicted=False,
+            component_data={SWA: _cd(value=value, host_value=host_value)},
+        )
+
+    def test_strict_device_only_node_truncates_match(self):
+        v = self._validator(strict=True)
+        node = self._node(4, value=[1, 2, 3, 4], host_value=None)
+        self.assertFalse(v(node))
+
+    def test_strict_host_node_extends_match(self):
+        v = self._validator(strict=True)
+        node = self._node(4, value=None, host_value=[0, 0, 0, 0])
+        self.assertTrue(v(node))
+
+    def test_strict_device_and_host_extends_match(self):
+        v = self._validator(strict=True)
+        node = self._node(4, value=[1, 2, 3, 4], host_value=[0, 0, 0, 0])
+        self.assertTrue(v(node))
+
+    def test_non_strict_trusts_device_value(self):
+        v = self._validator(strict=False)
+        node = self._node(4, value=[1, 2, 3, 4], host_value=None)
+        self.assertTrue(v(node))
+
+
 if __name__ == "__main__":
     unittest.main()

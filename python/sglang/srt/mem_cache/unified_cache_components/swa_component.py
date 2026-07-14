@@ -132,6 +132,7 @@ class SWAComponent(TreeComponent):
     ) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
+        strict_bit_exact = self._strict_bit_exact
         state = {"len": float("inf")}
 
         # unified_kv never caches the SWA ring (per-request, not content-stable),
@@ -148,6 +149,20 @@ class SWAComponent(TreeComponent):
                 state["len"] = 0
                 if swa_device_only_hicache and (node.backuped or not node.evicted):
                     return True
+                return False
+            # I2-prime: strict bit-exact never trusts the per-request device SWA
+            # ring as a cross-request truth source (it is recycled when the
+            # owner's req_pool_idx is reused). Only a durable host copy counts;
+            # a node with device value but no host copy truncates the match so
+            # reuse restores from host or recomputes (I6), instead of silently
+            # serving a stale device ring. Reuse becomes a pure function of
+            # host/L3 availability, independent of device residency.
+            if (
+                strict_bit_exact
+                and not match_device_only
+                and cd.host_value is None
+            ):
+                state["len"] = 0
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
