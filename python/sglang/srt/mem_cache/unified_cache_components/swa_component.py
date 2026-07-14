@@ -64,6 +64,9 @@ class SWAComponent(TreeComponent):
         # copy on host (that "Full-host without SWA-host" orphan would force a
         # non-bit-exact tail reprefill on reuse). Wired at pool-attach time.
         self._strict_bit_exact = False
+        # req_pool_idx of the request currently being cached; used to look up
+        # its prefill-captured SWA host pages during insert.
+        self._capture_rid = None
 
     component_type = ComponentType.SWA
 
@@ -308,6 +311,12 @@ class SWAComponent(TreeComponent):
             # Entire leaf is outside the SWA window — left as a tombstone.
             return
 
+        # Bind the prefill-captured host window to this SWA node. Both branches
+        # above leave `node` covering [swa_start, swa_start + len(value)) with
+        # swa_start == max(node_start, swa_evicted_seqlen).
+        self._bind_captured_swa_host(
+            node, max(node_start, params.swa_evicted_seqlen)
+        )
         self._maybe_split_leaf_for_swa_lock(node)
 
     def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
@@ -353,14 +362,27 @@ class SWAComponent(TreeComponent):
         child_swa_host_value = child.component_data[self.component_type].host_value
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
-            new_parent.component_data[self.component_type].host_value = (
-                child_swa_host_value[:split_len].clone()
-            )
-            child.component_data[self.component_type].host_value = child_swa_host_value[
-                split_len:
-            ].clone()
+            full_span = split_len + len(child.key)
             host_lru = self.cache.host_lru_lists[self.component_type]
-            if new_parent.component_data[self.component_type].value is None:
+            if len(child_swa_host_value) == full_span:
+                # Common case: host_value spans the whole node; split by key len.
+                new_parent.component_data[self.component_type].host_value = (
+                    child_swa_host_value[:split_len].clone()
+                )
+                child.component_data[self.component_type].host_value = (
+                    child_swa_host_value[split_len:].clone()
+                )
+            else:
+                # host_value holds only the sliding window at the child's end
+                # boundary, so it belongs entirely to the child. The parent's own
+                # boundary window (if any) is stored separately, not here.
+                new_parent.component_data[self.component_type].host_value = None
+                # child keeps child_swa_host_value unchanged
+            if (
+                new_parent.component_data[self.component_type].value is None
+                and new_parent.component_data[self.component_type].host_value
+                is not None
+            ):
                 host_lru.insert_mru(new_parent)
             if child.component_data[
                 self.component_type
@@ -595,6 +617,7 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        self._capture_rid = req.req_pool_idx
         return None
 
     def free_out_of_window_slots(
@@ -612,6 +635,64 @@ class SWAComponent(TreeComponent):
         insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
 
     # ---- HiCache Hooks ----
+
+    def _bind_captured_swa_host(
+        self, node: UnifiedTreeNode, swa_start: int
+    ) -> None:
+        """Set the node's SWA host_value from the prefill-captured host page
+        instead of backing up the (possibly stale) device ring.
+
+        The node ends at page boundary B; its SWA host copy is the single
+        captured window [B-win, B) keyed (rid, B), not the node's full value.
+        If that window was not captured (host pool full, or it fell outside this
+        chunk), leave host_value None so the node falls back to the normal
+        backup / recompute path.
+        """
+        hp = self._swa_kv_pool_host
+        if hp is None:
+            return
+        staging = getattr(hp, "_capture_staging", None)
+        rid = self._capture_rid
+        if not staging or rid is None:
+            return
+        cd = node.component_data[self.component_type]
+        if cd.value is None or cd.host_value is not None:
+            return
+        win = hp.slot_page_size
+        # The node ends at page boundary B = swa_start + len(value); its host
+        # copy is the single captured window keyed (rid, B). The earlier,
+        # out-of-window part of the node is never attended and is not stored.
+        node_end = swa_start + len(cd.value)
+        h = staging.pop((rid, int(node_end)), None)
+        if h is None:
+            # Window not captured -> fall back to normal backup / recompute.
+            return
+        host_value = h.to(torch.int64)
+        if len(host_value) != win:
+            hp.free(host_value)
+            return
+        self._attach_swa_host_value(node, host_value)
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        is_finished: bool,
+        insert_result: Optional[InsertResult] = None,
+        insert_params: Optional[InsertParams] = None,
+    ) -> None:
+        # Release any capture staging owned by this request that no node claimed
+        # (interior / out-of-window windows), then drop the stashed rid.
+        hp = self._swa_kv_pool_host
+        rid = self._capture_rid
+        self._capture_rid = None
+        if hp is None or rid is None:
+            return
+        staging = getattr(hp, "_capture_staging", None)
+        if not staging:
+            return
+        leftover = [k for k in staging if k[0] == rid]
+        for k in leftover:
+            hp.free(staging.pop(k))
 
     def build_hicache_transfers(
         self,
@@ -632,6 +713,10 @@ class SWAComponent(TreeComponent):
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
             if cd.value is None:
+                return None
+            if cd.host_value is not None:
+                # Already populated from prefill capture or a prior backup;
+                # do not re-copy the (possibly stale) device ring.
                 return None
             # cd.value already holds SWA-pool indices (translated at insert time).
             # Host pool indexing wants int64.
@@ -756,9 +841,15 @@ class SWAComponent(TreeComponent):
                 n_tokens = len(cd_n.host_value)
                 swa_chunk = device_indices[offset : offset + n_tokens].clone()
                 self._restore_device_value(n, swa_chunk)
-                assert cd_full_n.value is not None and len(cd_full_n.value) == n_tokens
-                # rebuild the mapping for the loaded SWA chunk
-                allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
+                # host_value may hold only the sliding window [B-n_tokens, B),
+                # shorter than the node's full value. Map the window's (last
+                # n_tokens) full indices to the restored SWA slots; out-of-window
+                # full tokens keep sentinel 0 (never read under the SWA mask).
+                # When host_value spans the whole node, value[-n_tokens:] ==
+                # value, so this matches the previous behaviour.
+                assert cd_full_n.value is not None and len(cd_full_n.value) >= n_tokens
+                window_full = cd_full_n.value[-n_tokens:]
+                allocator.set_full_to_swa_mapping(window_full, swa_chunk)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
             return

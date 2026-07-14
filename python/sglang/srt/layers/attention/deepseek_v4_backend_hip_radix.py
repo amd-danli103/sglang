@@ -1353,6 +1353,94 @@ class DeepseekV4HipRadixBackend(
             )
         return result
 
+    def capture_swa_windows(
+        self, layer_id: int, kv: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Capture the sliding-window KV at each page boundary for host offload.
+
+        The device SWA ring only keeps the current window, so windows at
+        interior page boundaries get overwritten during a long chunked prefill.
+        Snapshot them from the flat post-norm+rope extend-KV instead: at each
+        page boundary ``B`` in the chunk, copy the trailing window ``kv[B-win:B]``
+        into the host SWA pool in token order (matching the ring->host backup
+        layout, so restore is byte-identical). The page's first half
+        ``[B-page, B-win)`` is never inside a boundary window and is not
+        captured. The host page is allocated once per ``(req, B)`` on the first
+        SWA layer and reused by later layers. No-op unless the host SWA pool has
+        been wired onto the device pool (feature enabled).
+        """
+        pool = self.token_to_kv_pool
+        host_pool = getattr(pool, "_swa_host_pool", None)
+        if host_pool is None:
+            return
+        if kv is None or not forward_batch.forward_mode.is_extend():
+            return
+        ext = forward_batch.extend_seq_lens_cpu
+        seqs = forward_batch.seq_lens_cpu
+        if ext is None or seqs is None:
+            return
+
+        staging = host_pool._capture_staging
+        # One host page == one window == unified_swa_ring_size rows, stored in
+        # token order to match the ring->host backup layout.
+        win = pool.unified_swa_ring_size
+        assert win == pool.unified_swa_window, (
+            "SWA capture does not support speculative ring slack yet: "
+            f"ring_size={win} window={pool.unified_swa_window}"
+        )
+        page = self.page_size
+        slot_page = host_pool.slot_page_size
+        assert page % win == 0 and win == slot_page, (
+            f"SWA tile geometry mismatch: page={page} win={win} "
+            f"slot_page={slot_page}"
+        )
+        swa_layer = layer_id - pool.start_layer
+        host_layer_buf = host_pool.data_refs[swa_layer]
+
+        # Stride by `page`: at each page boundary B capture the trailing window
+        # [B-win, B) as one host page keyed (rid, B). A query at position >= B
+        # looks back at most `win`, so [B-page, B-win) is never inside a boundary
+        # window and is not captured. `cs` is page-aligned, so [B-win, B) lies
+        # fully within this chunk.
+        seqs_l = seqs.tolist()
+        req_l = forward_batch.req_pool_indices.tolist()
+        offset = 0
+        for i, e in enumerate(ext):
+            e = int(e)
+            if e <= 0:
+                continue
+            total = int(seqs_l[i])
+            cs = total - e
+            rid = int(req_l[i])
+            boundary = (total // page) * page  # last page-aligned pos in chunk
+            B = ((cs // page) + 1) * page  # first page boundary after cs
+            while B <= boundary:
+                assert B - win >= cs, f"window before chunk: B={B} win={win} cs={cs}"
+                key = (rid, int(B))
+                hidx = staging.get(key)
+                if hidx is None:
+                    hidx = host_pool.alloc(win)
+                    if hidx is None:
+                        # Host pool full: skip this boundary (reuse recomputes it).
+                        B += page
+                        continue
+                    staging[key] = hidx
+                win_slice = kv[offset + (B - win - cs) : offset + (B - cs)]
+                assert (
+                    win_slice.numel() * win_slice.element_size() == host_pool.item_bytes
+                ), (
+                    "SWA window bytes != host item_bytes: "
+                    f"{win_slice.numel() * win_slice.element_size()} vs "
+                    f"{host_pool.item_bytes}"
+                )
+                page_row = int(hidx[0].item()) // slot_page
+                host_layer_buf[page_row].copy_(
+                    win_slice.contiguous().view(torch.uint8).reshape(-1),
+                    non_blocking=True,
+                )
+                B += page
+            offset += e
+
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:

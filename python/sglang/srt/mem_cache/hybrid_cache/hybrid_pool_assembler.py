@@ -471,6 +471,12 @@ def build_deepseek_v4_hicache_stack(
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
+        # Expose the host SWA pool + capture staging on the device kvcache so
+        # both the model forward (window capture) and swa_component insert
+        # (binding) can reach them.
+        kvcache._swa_host_pool = swa_host_pool
+        if not hasattr(swa_host_pool, "_capture_staging"):
+            swa_host_pool._capture_staging = {}
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
             build_pool_entry(

@@ -279,10 +279,6 @@ class TestSwaComponentRouting(unittest.TestCase):
         self.assertGreaterEqual(calls["lru_get"], 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestWriteBackGuard(unittest.TestCase):
     """Strict bit-exact must fail fast at build() entry if write policy is not
     write_through (write_back can leave the SWA ring un-offloaded -> silent
@@ -527,3 +523,7 @@ class TestStrictL2Only(unittest.TestCase):
         self.assertEqual(len(transfers), 1)
         self.assertEqual(transfers[0].name, PoolName.SWA)
         self.assertEqual(transfers[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
+
+
+if __name__ == "__main__":
+    unittest.main()
