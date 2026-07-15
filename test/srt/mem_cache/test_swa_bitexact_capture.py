@@ -23,6 +23,7 @@ import torch
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
@@ -528,6 +529,147 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
         self.assertTrue(
             torch.equal(device_indices, torch.tensor([100, 101, 102, 103]))
         )
+
+
+class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
+    """Mine 2 (warm reuse): a window node that is BOTH device-resident
+    (`cd.value` present, a per-request device-ring slot recycled across
+    requests) AND host-backed (`cd.host_value` present, the durable
+    cross-request truth) must still be restored from host on reuse.
+
+    Before this fix, two places disagreed and silently dropped it:
+      * `build_hicache_transfers(LOAD_BACK)` treated `cd.value is not None`
+        as "device exists, skip it", so the node was never collected into
+        `nodes_to_load` / `host_indices` -- no SWA transfer was built for it.
+      * `finalize_match_result` counted it as `n_swa += len(cd.value)` (not
+        `swa_host_hit`), so `swa_host_hit_length` stayed 0 and the
+        `load_back` gate never opened in the first place.
+
+    Both must use the SAME host-backed predicate (`cd.host_value is not
+    None`, strict mode) so that whenever the gate opens, the transfer that
+    later runs actually contains this node. `finalize_match_result`
+    additionally gates on `for_reuse=True`: self-match (`for_reuse=False`,
+    e.g. `cache_unfinished_req`) must keep the OLD behavior, since the
+    request's own freshly-computed nodes aren't host-backed yet and
+    falsely opening the gate there would be wrong.
+    """
+
+    WIN = 4
+
+    def _node_and_root(self, *, value, host_value):
+        root = types.SimpleNamespace(component_data={}, parent=None)
+        node = types.SimpleNamespace(
+            parent=root,
+            component_data={SWA: _cd(value=value, host_value=host_value)},
+        )
+        return root, node
+
+    def _comp(self, *, strict):
+        return types.SimpleNamespace(
+            sliding_window_size=self.WIN,
+            component_type=SWA,
+            _swa_kv_pool_host=object(),  # host pool wired -> feature on
+            _strict_bit_exact=strict,
+            cache=types.SimpleNamespace(cache_controller=object()),
+        )
+
+    def _device_and_host_backed_node(self):
+        return self._node_and_root(
+            value=torch.tensor([900, 901, 902, 903], dtype=torch.int64),
+            host_value=torch.tensor([1, 1, 1, 1], dtype=torch.int64),
+        )
+
+    def test_device_and_host_backed_node_is_collected_by_build(self):
+        """The build-side predicate change: previously skipped, now
+        collected into nodes_to_load whenever cd.host_value is not None,
+        regardless of cd.value."""
+        root, node = self._device_and_host_backed_node()
+        comp = self._comp(strict=True)
+        comp.cache.root_node = root
+
+        transfers = SWAComponent.build_hicache_transfers(
+            comp, node, CacheTransferPhase.LOAD_BACK
+        )
+
+        self.assertIsNotNone(transfers)
+        xfer = transfers[0]
+        self.assertIn(node, xfer.nodes_to_load)
+        self.assertTrue(
+            torch.equal(
+                xfer.host_indices, node.component_data[SWA].host_value
+            )
+        )
+
+    def test_finalize_counts_host_backed_node_on_reuse(self):
+        """The finalize-side predicate change, gated on for_reuse=True: a
+        device+host-resident node must count into swa_host_hit_length so the
+        load_back gate opens, matching the build-side predicate above."""
+        root, node = self._device_and_host_backed_node()
+        comp = self._comp(strict=True)
+        comp.cache.root_node = root
+        result = MatchResult(
+            device_indices=torch.tensor([], dtype=torch.int64),
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+            host_hit_length=0,
+        )
+
+        out = SWAComponent.finalize_match_result(
+            comp,
+            result=result,
+            params=MatchPrefixParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])), for_reuse=True
+            ),
+            value_chunks=[],
+            best_value_len=0,
+        )
+
+        self.assertGreater(out.swa_host_hit_length, 0)
+
+    def test_finalize_self_match_keeps_old_behavior(self):
+        """Guard: for_reuse=False (self-match, e.g. cache_unfinished_req)
+        must NOT count the same device+host-resident node into
+        swa_host_hit_length -- cd.value stays trusted first, so warm
+        self-match does not falsely open the load_back gate."""
+        root, node = self._device_and_host_backed_node()
+        comp = self._comp(strict=True)
+        comp.cache.root_node = root
+        result = MatchResult(
+            device_indices=torch.tensor([], dtype=torch.int64),
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+            host_hit_length=0,
+        )
+
+        out = SWAComponent.finalize_match_result(
+            comp,
+            result=result,
+            params=MatchPrefixParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])), for_reuse=False
+            ),
+            value_chunks=[],
+            best_value_len=0,
+        )
+
+        self.assertEqual(out.swa_host_hit_length, 0)
+
+    def test_non_strict_build_keeps_skipping_device_resident_node(self):
+        """Guard: best-effort (non-strict) mode is unaffected by the
+        strict-mode-scoped build change -- a device-resident node stays
+        skipped even when also host-backed."""
+        root, node = self._device_and_host_backed_node()
+        comp = self._comp(strict=False)
+        comp.cache.root_node = root
+
+        transfers = SWAComponent.build_hicache_transfers(
+            comp, node, CacheTransferPhase.LOAD_BACK
+        )
+
+        # Skipped (device exists), and nothing else host-only above it in
+        # this single-node chain -> no transfer at all.
+        self.assertIsNone(transfers)
 
 
 if __name__ == "__main__":

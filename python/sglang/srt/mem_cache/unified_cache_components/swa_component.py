@@ -292,9 +292,22 @@ class SWAComponent(TreeComponent):
         swa_host_hit = 0
         node = result.best_match_node
         root = self.cache.root_node
+        # Mine 2 (warm reuse): on the reuse path in strict mode, the per-request
+        # device SWA ring is not a durable cross-request truth (I2'), so a node
+        # that is BOTH device-resident and host-backed must still be counted as
+        # a host hit -- otherwise swa_host_hit_length stays 0 and the load_back
+        # gate never opens for it. This uses the SAME host-backed predicate as
+        # build_hicache_transfers(LOAD_BACK) below. Self-match (for_reuse=False)
+        # keeps the OLD behavior: cd.value is trusted first, since the request's
+        # own freshly-computed nodes aren't host-backed yet and
+        # cache_unfinished_req relies on this not falsely opening the gate.
+        strict_reuse = self._strict_bit_exact and params.for_reuse
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
-            if cd.value is not None:
+            if strict_reuse and cd.host_value is not None:
+                swa_host_hit += len(cd.host_value)
+                n_swa += len(cd.host_value)
+            elif cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
                 # TODO(hzh): load_back may currently restore a full host-tombstone
@@ -989,8 +1002,21 @@ class SWAComponent(TreeComponent):
             while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
-                if cd.value is not None:
-                    # device exists, skip it
+                if self._strict_bit_exact and cd.host_value is not None:
+                    # Mine 2 (warm reuse): the per-request device SWA ring is
+                    # not a durable cross-request truth in strict mode, even
+                    # when `cd.value` is still set (stale, recycled slot from
+                    # a prior request). Collect the host copy so it is loaded
+                    # and commit_hicache_transfer's _restore_device_value
+                    # overwrites the stale slot with host truth. Same
+                    # host-backed predicate as finalize_match_result's
+                    # for_reuse=True gate above.
+                    backed_up.append(cd.host_value)
+                    nodes.append(cur)
+                    n_swa += len(cd.host_value)
+                elif cd.value is not None:
+                    # device exists (best-effort mode, or strict with no
+                    # durable host copy), skip it
                     n_swa += len(cd.value)
                 else:
                     # host only, collect it
