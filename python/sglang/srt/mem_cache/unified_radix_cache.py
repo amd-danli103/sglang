@@ -579,7 +579,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, for_reuse=params.for_reuse)
         return self._match_post_processor(
             params,
             value,
@@ -899,18 +899,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, for_reuse: bool = False
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
+        #
+        # `for_reuse` distinguishes cross-request reuse matches (scheduler) from
+        # self-match lookups (`cache_unfinished_req`). On the device-only match
+        # validators, `cd.value` is trusted even without a durable host copy —
+        # required for self-match (the request's own freshly-computed nodes
+        # aren't host-backed yet), but unsafe on reuse (the per-request SWA
+        # device ring is recycled across requests, so a device-only match past
+        # the host-gated boundary can be stale). So on reuse we clamp the FULL
+        # device anchor to the host-gated `best_match_node` boundary below.
         node = self.root_node
         child_key = key.child_key(self.page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        # FULL value-chunk length at the moment `best_match_node` (the node
+        # accepted by ALL validators, i.e. host-gated) was last set. Only
+        # meaningful when `best_match_node` is device-resident at that point,
+        # which holds for the Mine-1 scenario this clamp targets.
+        best_match_value_len = 0
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
             validators = tuple(
@@ -932,9 +946,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         def _update_best_if_valid(node):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
+            nonlocal best_match_value_len
             matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
+                best_match_value_len = len(value)
 
             if not separate_device_match:
                 if matched:
@@ -967,6 +983,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
+
+        if for_reuse:
+            # Reuse path only: never let the FULL device anchor extend past the
+            # host-gated best_match_node boundary, even if the per-request
+            # device-only validators (trusting `cd.value`) matched further.
+            # Self-match must NOT clamp here — see docstring above.
+            best_match_device_value_len = min(
+                best_match_device_value_len, best_match_value_len
+            )
 
         return (
             value,

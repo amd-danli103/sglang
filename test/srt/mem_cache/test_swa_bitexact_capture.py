@@ -16,6 +16,7 @@ Covers:
 
 import types
 import unittest
+from array import array
 
 import torch
 
@@ -23,12 +24,14 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 
 SWA = ComponentType.SWA
 FULL = BASE_COMPONENT_TYPE
@@ -358,6 +361,173 @@ class TestStrictMatchValidatorI2Prime(unittest.TestCase):
         v = self._validator(strict=False)
         node = self._node(4, value=[1, 2, 3, 4], host_value=None)
         self.assertTrue(v(node))
+
+
+class TestReuseAnchorHostClamp(unittest.TestCase):
+    """Mine 1: on cross-request reuse, the FULL device anchor
+    (`best_match_device_value_len`) must not extend past the SWA host-gated
+    `best_match_node` boundary, because the device-only validator trusts the
+    per-request (recycled-across-requests) SWA device ring `cd.value` even
+    without a durable host copy. `for_reuse=True` (scheduler reuse-match)
+    clamps; `for_reuse=False` (self-match, e.g. `cache_unfinished_req`) must
+    NOT clamp, or the I2' self-match invariant it depends on breaks and
+    `cache_unfinished_req` trips its `new_prefix_len <= len(new_indices)`
+    assertion.
+
+    Builds a minimal 2-node chain root -> node_a -> node_b directly on real
+    `UnifiedTreeNode`/`RadixKey` objects (matching the plain SimpleNamespace
+    fake-component style used elsewhere in this file), with fake FULL/SWA
+    components whose validators reproduce the real host-gated vs
+    device-only-trusts-`cd.value` semantics from `TestStrictMatchValidatorI2Prime`
+    above:
+      * node_a: SWA has BOTH device value and durable host_value -> valid
+        under every validator (host-gated boundary).
+      * node_b: SWA has ONLY a device value (host_value=None) -> the
+        per-request device ring; device-only validator still accepts it
+        (I2'-required for self-match), but the host-gated validator rejects
+        it (durable-copy requirement), so best_match_node stops at node_a.
+    Both nodes are FULL-device-resident, so their FULL chunks are appended
+    into `value` and `best_match_value_len` is well-defined at node_a.
+    """
+
+    PAGE_SIZE = 2
+
+    def _make_full_component(self):
+        def create_match_validator(match_device_only=False):
+            return (
+                lambda node: node.component_data[ComponentType.FULL].value
+                is not None
+            )
+
+        return types.SimpleNamespace(
+            component_type=ComponentType.FULL,
+            create_match_validator=create_match_validator,
+        )
+
+    def _make_swa_component(self):
+        def create_match_validator(match_device_only=False):
+            if match_device_only:
+                # I2'-required for self-match: trusts the per-request device
+                # ring slot even without a durable host copy.
+                return (
+                    lambda node: node.component_data[ComponentType.SWA].value
+                    is not None
+                )
+            # Host-gated (strict): only a durable host copy extends the match.
+            return (
+                lambda node: node.component_data[ComponentType.SWA].host_value
+                is not None
+            )
+
+        return types.SimpleNamespace(
+            component_type=ComponentType.SWA,
+            create_match_validator=create_match_validator,
+        )
+
+    def _build_chain(self):
+        """root -> node_a (device+host SWA) -> node_b (device-only SWA)."""
+        tree_components = (ComponentType.FULL, ComponentType.SWA)
+        root = UnifiedTreeNode(tree_components)
+
+        node_a = UnifiedTreeNode(tree_components)
+        node_a.parent = root
+        node_a.key = RadixKey(array("q", [1, 2]))
+        node_a.component_data[ComponentType.FULL].value = torch.tensor(
+            [100, 101], dtype=torch.int64
+        )
+        node_a.component_data[ComponentType.SWA].value = torch.tensor(
+            [900, 901], dtype=torch.int64
+        )
+        node_a.component_data[ComponentType.SWA].host_value = torch.tensor(
+            [1, 1], dtype=torch.int64
+        )
+        root.children[(1, 2)] = node_a
+
+        node_b = UnifiedTreeNode(tree_components)
+        node_b.parent = node_a
+        node_b.key = RadixKey(array("q", [3, 4]))
+        node_b.component_data[ComponentType.FULL].value = torch.tensor(
+            [102, 103], dtype=torch.int64
+        )
+        # Stale per-request SWA device ring slot: device value present, but
+        # NOT durably backed on host (recycled across requests).
+        node_b.component_data[ComponentType.SWA].value = torch.tensor(
+            [902, 903], dtype=torch.int64
+        )
+        node_b.component_data[ComponentType.SWA].host_value = None
+        node_a.children[(3, 4)] = node_b
+
+        return root, node_a, node_b
+
+    def _run_match_prefix_helper(self, for_reuse: bool):
+        root, node_a, node_b = self._build_chain()
+        fake_self = types.SimpleNamespace(
+            root_node=root,
+            page_size=self.PAGE_SIZE,
+            # Non-None -> triggers the separate device-match validator path
+            # (device_validators distinct from host-gated validators).
+            cache_controller=object(),
+            _components_tuple=(
+                self._make_full_component(),
+                self._make_swa_component(),
+            ),
+        )
+        key = RadixKey(array("q", [1, 2, 3, 4]))
+        (
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_match_device_value_len,
+        ) = UnifiedRadixCache._match_prefix_helper(
+            fake_self, key, for_reuse=for_reuse
+        )
+        if best_match_device_value_len > 0:
+            device_indices = torch.cat(value[:best_match_device_value_len])
+        else:
+            device_indices = torch.tensor([], dtype=torch.int64)
+        return node_a, node_b, best_match_node, best_match_device_node, device_indices
+
+    def test_reuse_clamps_device_anchor_to_host_gated_node(self):
+        """for_reuse=True: device residency (node_b) extends past the
+        host-gated best_match_node (node_a) -> the FULL device anchor must be
+        clamped to node_a's boundary, excluding the stale node_b region."""
+        (
+            node_a,
+            node_b,
+            best_match_node,
+            best_match_device_node,
+            device_indices,
+        ) = self._run_match_prefix_helper(for_reuse=True)
+
+        # Host-gated boundary is unaffected by the flag: still node_a.
+        self.assertIs(best_match_node, node_a)
+        # Uncached the device-only validators trust node_b's stale ring slot.
+        self.assertIs(best_match_device_node, node_b)
+        # But the clamp must cap the returned device anchor at node_a's chunk
+        # only (page_size=2 tokens), never reaching into node_b's stale region.
+        self.assertEqual(len(device_indices), self.PAGE_SIZE)
+        self.assertTrue(torch.equal(device_indices, torch.tensor([100, 101])))
+
+    def test_self_match_does_not_clamp_device_anchor(self):
+        """for_reuse=False (self-match, e.g. cache_unfinished_req): the same
+        tree shape must NOT be clamped, so device_indices still covers both
+        node_a and node_b (the request's own, not-yet-host-backed nodes),
+        matching the I2' self-match invariant `cache_unfinished_req` relies on."""
+        (
+            node_a,
+            node_b,
+            best_match_node,
+            best_match_device_node,
+            device_indices,
+        ) = self._run_match_prefix_helper(for_reuse=False)
+
+        self.assertIs(best_match_node, node_a)
+        self.assertIs(best_match_device_node, node_b)
+        # NOT clamped: covers both node_a and node_b's chunks.
+        self.assertEqual(len(device_indices), 2 * self.PAGE_SIZE)
+        self.assertTrue(
+            torch.equal(device_indices, torch.tensor([100, 101, 102, 103]))
+        )
 
 
 if __name__ == "__main__":
