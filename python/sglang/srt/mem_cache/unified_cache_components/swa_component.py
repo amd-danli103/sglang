@@ -208,6 +208,10 @@ class SWAComponent(TreeComponent):
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
         node.component_data[ct].value = value
+        # A freshly (re)assigned device SWA value is live for the current
+        # holder; drop any stale deferred owner-release intent from a prior life.
+        if getattr(node, "_swa_release_pending", False):
+            node._swa_release_pending = False
         host_lru = self.cache.host_lru_lists[ct]
         if host_lru.in_list(node):
             host_lru.remove_node(node)
@@ -251,12 +255,19 @@ class SWAComponent(TreeComponent):
                     return True
                 return False
             # I2-prime: strict bit-exact never trusts the per-request device SWA
-            # ring as a cross-request truth source (it is recycled when the
-            # owner's req_pool_idx is reused). Only a durable host copy counts;
-            # a node with device value but no host copy truncates the match so
-            # reuse restores from host or recomputes (I6), instead of silently
-            # serving a stale device ring. Reuse becomes a pure function of
-            # host/L3 availability, independent of device residency.
+            # ring as a cross-request truth source for the REUSE boundary (the
+            # device ring is recycled when the owner's req_pool_idx is reused).
+            # Only a durable host copy counts for the device-or-host reuse match;
+            # a node with device value but no host copy truncates the reuse match
+            # so it restores from host (LOAD_BACK) or recomputes (I6) instead of
+            # serving a stale device ring. This is scoped to the reuse match
+            # (``not match_device_only``): the device-only match must still report
+            # a request's own freshly-computed, not-yet-backed-up nodes as device
+            # resident, else cache_unfinished_req's self-match returns empty
+            # device indices (new_prefix_len > len(new_indices)). Stale device
+            # residency across requests is instead closed by the deferred
+            # owner-release tombstone, which nulls the device value once the host
+            # copy is durable.
             if (
                 strict_bit_exact
                 and not match_device_only
@@ -596,7 +607,19 @@ class SWAComponent(TreeComponent):
         if not self._strict_bit_exact or self._swa_kv_pool_host is None:
             return
         cd = node.component_data[self.component_type]
-        if cd.value is None or cd.host_value is None or cd.lock_ref > 0:
+        if cd.value is None:
+            return
+        if cd.host_value is None or cd.lock_ref > 0:
+            # Host copy not durable yet (async write_through backup still in
+            # flight) or another request still holds the SWA lock, so we cannot
+            # free the device ring value right now. But once this owner is gone
+            # the per-request ring slot is recycled and its bytes become stale,
+            # so the value MUST NOT be trusted for cross-request reuse. Defer:
+            # mark the node so the coordinated BACKUP_HOST commit drops the
+            # device value the instant the host copy becomes durable and no
+            # holder remains. Without this the device ring is never invalidated
+            # and reuse would keep a stale device slot alive (I1/I2 violation).
+            node._swa_release_pending = True
             return
         self.cache._evict_component_and_detach_lru(
             node, self, target=EvictLayer.DEVICE
@@ -1064,6 +1087,26 @@ class SWAComponent(TreeComponent):
                     node._swa_pending_host = None
                     # Adopt the ridden c4-state pages together (co-lifetime).
                     _promote_state_pending(self, node)
+            # Deferred owner-release tombstone: if the owning request finished
+            # while this host backup was still in flight (host_value was None at
+            # cache_finished_req, so evict_device_on_owner_release deferred the
+            # device free), drop the now-recycled per-request device SWA value
+            # now that the host copy is durable and no holder remains. This
+            # closes the async write_through race where the device ring would
+            # otherwise stay alive and be trusted on cross-request reuse.
+            if getattr(node, "_swa_release_pending", False):
+                cd = node.component_data[ct]
+                if (
+                    self._strict_bit_exact
+                    and self._swa_kv_pool_host is not None
+                    and cd.value is not None
+                    and cd.host_value is not None
+                    and cd.lock_ref == 0
+                ):
+                    node._swa_release_pending = False
+                    self.cache._evict_component_and_detach_lru(
+                        node, self, target=EvictLayer.DEVICE
+                    )
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
