@@ -265,6 +265,20 @@ class SWAComponent(TreeComponent):
                 state["len"] = 0
                 if swa_device_only_hicache and (node.backuped or not node.evicted):
                     return True
+                # Bit-exact device-anchor path: the SWA device ring only keeps
+                # the last `sliding_window_size` tokens, so an out-of-window
+                # node's SWA slot (cd.value) is recycled to None even though its
+                # SWA truth is durably host-backed and its FULL KV is still
+                # device resident. On the device-anchor lookup (match_device_only)
+                # such a node must NOT truncate the FULL device anchor:
+                # cache_unfinished_req's self-match needs device_indices to cover
+                # the whole FULL-resident prefix (else cache_protected_len can
+                # exceed len(new_indices)), and the SWA window is restored
+                # positionally from host on reuse. The FULL validator still gates
+                # FULL device residency, and reuse over-reach is reclamped to the
+                # host-gated boundary via for_reuse, so this is safe both ways.
+                if match_device_only and cd.host_value is not None:
+                    return True
                 return False
             # I2-prime: strict bit-exact never trusts the per-request device SWA
             # ring as a cross-request truth source for the REUSE boundary (the
@@ -1312,9 +1326,41 @@ class SWAComponent(TreeComponent):
         host_idx = host_idx.to(hp.gpu_device)
         for li in range(hp.layer_num):
             hp.load_to_device_per_layer(None, host_idx, device_idx, li, io_backend)
-        if _SWA_DBG_CHECKSUM and hasattr(self, "_dbg_verify_restore"):
-            for node, _ in windows:
-                self._dbg_verify_restore(node.component_data[self.component_type])
+        if _SWA_DBG_CHECKSUM:
+            if hasattr(self, "_dbg_verify_restore"):
+                for node, _ in windows:
+                    self._dbg_verify_restore(node.component_data[self.component_type])
+            self._dbg_verify_device_landing(hp, r, int(host_idx[0].item()) // ring)
+
+    def _dbg_verify_device_landing(self, hp, r, host_page_row):
+        """TEMP (SGLANG_SWA_DBG_CHECKSUM): after the positional H2D, read the
+        device ring page back and assert it byte-matches the host window page.
+        Proves the copy landed at unified_kv row r*ring (device page row == r),
+        not just that the host bytes are intact."""
+        import torch as _torch
+        _torch.cuda.synchronize()
+        bad = 0
+        for li in range(hp.layer_num):
+            dev = hp.device_buffers[li][r].detach().to("cpu")
+            host = hp.data_refs[li][host_page_row].detach().to("cpu")
+            if dev.numel() != host.numel() or not bool((dev == host).all().item()):
+                bad += 1
+                if bad <= 3:
+                    logger.warning(
+                        "[LB-DEV] MISMATCH layer=%s r=%s host_page=%s "
+                        "dev_bytes=%s host_bytes=%s",
+                        li, r, host_page_row, int(dev.numel()), int(host.numel()),
+                    )
+        n = getattr(hp, "_dbg_dev_verified", 0) + 1
+        hp._dbg_dev_verified = n
+        if bad == 0 and (n <= 5 or n % 50 == 0):
+            logger.warning(
+                "[LB-DEV] device landing byte-exact: %d restores "
+                "(layers=%d, page row r=%d)",
+                n, hp.layer_num, r,
+            )
+        elif bad:
+            logger.warning("[LB-DEV] device landing FAILED: %d/%d layers mismatch (r=%d)", bad, hp.layer_num, r)
 
     def _gather_window_full_indices(
         self, node: UnifiedTreeNode, n_tokens: int

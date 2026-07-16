@@ -574,6 +574,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
             component_type=SWA,
             _swa_kv_pool_host=object(),  # host pool wired -> feature on
             _strict_bit_exact=strict,
+            _unified_positional_swa=False,
             cache=types.SimpleNamespace(cache_controller=object()),
         )
 
