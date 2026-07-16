@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
+
+_STATECAP_DBG_LOGGER = logging.getLogger(__name__)
+_STATECAP_DBG_SEEN = set()
+
+
+def _statecap_dbg(msg):
+    if msg not in _STATECAP_DBG_SEEN:
+        _STATECAP_DBG_SEEN.add(msg)
+        _STATECAP_DBG_LOGGER.warning("[STATECAP-DBG] %s", msg)
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -194,7 +204,9 @@ class CompressorHip(_CompressorBase):
         the restored state on the same slots. No-op unless the bit-exact host
         state pool has been wired onto the device pool.
         """
+        idx = self.is_in_indexer
         if self.ratio != 4:
+            _statecap_dbg(f"indexer={idx} ret: ratio={self.ratio}!=4")
             return
         token_to_kv_pool = backend.token_to_kv_pool
         attr = (
@@ -204,15 +216,23 @@ class CompressorHip(_CompressorBase):
         )
         hp = getattr(token_to_kv_pool, attr, None)
         if hp is None:
+            _statecap_dbg(f"indexer={idx} ret: hp None ({attr})")
             return
         layer_index = getattr(token_to_kv_pool, "_c4_state_layer_index", None)
         if layer_index is None:
+            _statecap_dbg(f"indexer={idx} ret: layer_index None")
             return
         li = layer_index.get(self.layer_id)
         if li is None:
+            _statecap_dbg(
+                f"indexer={idx} ret: li None layer_id={self.layer_id} "
+                f"keys={sorted(layer_index.keys())[:8]}"
+            )
             return
         if extend_len <= 0:
+            _statecap_dbg(f"indexer={idx} ret: extend_len<=0")
             return
+        _statecap_dbg(f"indexer={idx} PASS gating layer_id={self.layer_id} li={li}")
 
         page = backend.page_size
         swa_ring = token_to_kv_pool.unified_swa_ring_size
@@ -245,9 +265,11 @@ class CompressorHip(_CompressorBase):
             if hidx is None:
                 hidx = hp.alloc(slot_page)
                 if hidx is None:
+                    _statecap_dbg(f"indexer={idx} ALLOC FULL key={key}")
                     B += page
                     continue
                 staging[key] = hidx
+                _statecap_dbg(f"indexer={idx} STAGED key={key}")
             buf_lo = pre_len + (B - win - prefix_len)
             buf_hi = pre_len + (B - prefix_len)
             win_slice = state_buf[buf_lo:buf_hi]
@@ -604,11 +626,34 @@ class CompressorHip(_CompressorBase):
         forward_batch: ForwardBatch,
         attn_backend: AttentionBackend,
     ) -> torch.Tensor:
-        if self.use_fused_compress and (
-            envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+        # Strict bit-exact SWA HiCache captures the c4 / c4-indexer overlap
+        # state at each page boundary, but that capture hook only lives in the
+        # paged extend path (`compress_extend_paged` -> `_capture_compress_
+        # state_windows`). The fused path bypasses it, so when the flag is on we
+        # must route the ratio==4 (overlap) compressors through the paged path
+        # or the state is never staged and cross-request reuse silently falls
+        # back to full recompute. ratio==128 (c128) needs no capture (I8), so it
+        # keeps the fused fast path. Flag OFF -> behavior unchanged.
+        strict_capture_needs_paged = (
+            self.ratio == 4
+            and envs.SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE.get()
+        )
+        _statecap_dbg(
+            f"GATE ratio={self.ratio} fused={self.use_fused_compress} "
+            f"fused_triton={self.use_fused_compress_triton} overlap={self.overlap} "
+            f"envflag_os={os.getenv(chr(83)+chr(71)+chr(76)+chr(65)+chr(78)+chr(71)+chr(95)+chr(85)+chr(78)+chr(73)+chr(70)+chr(73)+chr(69)+chr(68)+chr(95)+chr(75)+chr(86)+chr(95)+chr(83)+chr(87)+chr(65)+chr(95)+chr(66)+chr(73)+chr(84)+chr(95)+chr(69)+chr(88)+chr(65)+chr(67)+chr(84)+chr(95)+chr(72)+chr(73)+chr(67)+chr(65)+chr(67)+chr(72)+chr(69))} "
+            f"envflag_get={envs.SGLANG_UNIFIED_KV_SWA_BIT_EXACT_HICACHE.get()} "
+            f"needs_paged={strict_capture_needs_paged} mode={forward_batch.forward_mode}"
+        )
+        if (
+            self.use_fused_compress
+            and not strict_capture_needs_paged
             and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_extend_without_speculative()
+                envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_extend_without_speculative()
+                )
             )
         ):
             return self.compress_fused(

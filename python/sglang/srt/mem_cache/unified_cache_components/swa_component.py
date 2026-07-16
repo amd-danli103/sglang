@@ -48,6 +48,13 @@ def _state_rides(comp):
     """(host_pool, device_state_pools, pending_attr, host_value_attr) for each
     enabled compress-state pool that rides an SWA node. Empty unless strict
     bit-exact wired the c4 state pools (non-DSv4 / flag-off / test fake)."""
+    # SWA-ONLY validation gate: decouple the SWA host reuse pipeline from the
+    # c4/indexer compress-state co-lifetime so the SWA capture->bind->promote->
+    # load-back path can be validated end-to-end on its own. NOT bit-exact wrt
+    # the compressed pre-state; used only to bring up the SWA path first.
+    import os as _os
+    if _os.environ.get("SGLANG_SWA_HICACHE_SWA_ONLY", "0") == "1":
+        return []
     if getattr(comp, "_c4_state_layer_index", None) is None:
         return []
     rides = []
@@ -172,6 +179,11 @@ class SWAComponent(TreeComponent):
         self._c4_state_layer_index = None
         self._compress_state_pools = None
         self._indexer_compress_state_pools = None
+        # unified_kv positional SWA ring: SWA device slots are computed as
+        # req_pool_idx*ring + pos%ring (not free-list allocated). Restore on
+        # reuse must be positional + deferred until req_pool_idx is known
+        # (prepare_for_extend), so load_back only stashes the window on the req.
+        self._unified_positional_swa = False
 
     component_type = ComponentType.SWA
 
@@ -851,15 +863,29 @@ class SWAComponent(TreeComponent):
         (rid, B). If it was not captured (host pool full / outside this chunk),
         leave the node to the normal backup / recompute path.
         """
+        if _SWA_DBG_CHECKSUM:
+            logger.warning("[BIND-DBG] enter swa_start=%s", swa_start)
         hp = self._swa_kv_pool_host
         if hp is None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning("[BIND-DBG] early: no swa host pool")
             return
         staging = getattr(hp, "_capture_staging", None)
         rid = self._capture_rid
         if not staging or rid is None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] early: staging_empty=%s rid=%s", not staging, rid
+                )
             return
         cd = node.component_data[self.component_type]
         if cd.value is None or cd.host_value is not None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] early: cd.value_none=%s host_value_set=%s",
+                    cd.value is None,
+                    cd.host_value is not None,
+                )
             return
         win = hp.slot_page_size
         # The node ends at page boundary B = swa_start + len(value); its host
@@ -868,6 +894,13 @@ class SWAComponent(TreeComponent):
         node_end = swa_start + len(cd.value)
         h = staging.pop((rid, int(node_end)), None)
         if h is None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] SWA staging MISS key=(%s,%s) staging_keys=%s",
+                    rid,
+                    int(node_end),
+                    list(staging.keys())[:6],
+                )
             # Window not captured -> fall back to normal backup / recompute.
             return
         host_value = h.to(torch.int64)
@@ -888,11 +921,26 @@ class SWAComponent(TreeComponent):
             if sh is None:
                 atomic_ok = False
         if not atomic_ok:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] atomic FAIL rides=%d missing=%s key=(%s,%s)",
+                    len(rides),
+                    [pa for _shp, pa, sh in state_tiles if sh is None],
+                    rid,
+                    int(node_end),
+                )
             for shp, _pa, sh in state_tiles:
                 if sh is not None:
                     shp.free(sh)
             hp.free(host_value)
             return
+        if _SWA_DBG_CHECKSUM:
+            logger.warning(
+                "[BIND-DBG] BOUND host_value key=(%s,%s) rides=%d",
+                rid,
+                int(node_end),
+                len(rides),
+            )
         # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
         node._swa_pending_host = host_value
         for _shp, pending_attr, sh in state_tiles:
@@ -1031,6 +1079,17 @@ class SWAComponent(TreeComponent):
             backed_up.reverse()
             nodes.reverse()
 
+            if self._unified_positional_swa and req is not None:
+                # unified_kv: the SWA device slot is req_pool_idx*ring + pos%ring,
+                # computable only after prepare_for_extend assigns req_pool_idx.
+                # Do NOT allocate a device slot / issue an H->D transfer here
+                # (the swa_attn_allocator is page_size=256 and unrelated to the
+                # positional ring -> alloc(win) returns empty -> crash). Stash the
+                # window pages (host_value, in token order) on the req; the
+                # scheduler restores them positionally before the first forward.
+                req._swa_restore_windows = list(zip(nodes, backed_up))
+                return None
+
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
@@ -1157,6 +1216,37 @@ class SWAComponent(TreeComponent):
                 # match. In the common (unsplit) case the node own full value
                 # already has >= n_tokens and no ancestor is touched.
                 window_full = self._gather_window_full_indices(n, n_tokens)
+                if _SWA_DBG_CHECKSUM:
+                    _fv = n.component_data[BASE_COMPONENT_TYPE].value
+                    logger.warning(
+                        "[LB-DBG] rid=%s n_tokens=%s wfull=%s swa_chunk=%s "
+                        "off=%s dev_total=%s host_total=%s own_full=%s",
+                        getattr(self, "_capture_rid", None),
+                        n_tokens,
+                        int(window_full.numel()),
+                        int(swa_chunk.numel()),
+                        offset,
+                        int(device_indices.numel()),
+                        int(len(xfer.host_indices)),
+                        (None if _fv is None else len(_fv)),
+                    )
+                # Diagnostic guard (S2/S3): the full<->swa mapping must feed
+                # equal-length index tensors. If the restored SWA device
+                # chunk is shorter than the window full indices (device
+                # under-allocation, or a node whose host_value length changed
+                # between build and commit), fail here with the exact sizes
+                # instead of the opaque allocator assert (full==swa).
+                if swa_chunk.numel() < window_full.numel():
+                    _fv2 = n.component_data[BASE_COMPONENT_TYPE].value
+                    raise AssertionError(
+                        "SWA load_back index-length mismatch "
+                        f"(swa_chunk={swa_chunk.numel()} < "
+                        f"window_full={window_full.numel()}): "
+                        f"n_tokens={n_tokens} offset={offset} "
+                        f"dev_total={device_indices.numel()} "
+                        f"host_total={len(xfer.host_indices)} "
+                        f"own_full={None if _fv2 is None else len(_fv2)}"
+                    )
                 allocator.set_full_to_swa_mapping(
                     window_full, swa_chunk[-window_full.numel() :]
                 )
@@ -1177,6 +1267,54 @@ class SWAComponent(TreeComponent):
                 pool_storage_result=pool_storage_result,
             )
             return
+
+    def restore_pending_swa_windows(self, req, req_pool_idx, io_backend):
+        """Positional SWA restore for unified_kv (deferred from load_back).
+
+        The SWA sliding-window read is purely positional (paged_decode_indices:
+        slot*ring + pos%ring) and never consults full_to_swa_index_mapping, so
+        the reused window bytes must physically sit at req_pool_idx*ring +
+        pos%ring. req_pool_idx is only known now (after prepare_for_extend), so
+        load_back stashed the host window pages on the req; copy them H->D into
+        this request ring block, one window page per layer.
+
+        The reuse prefix is page-aligned and page % ring == 0, so the trailing
+        window maps to the contiguous ring block [r*ring, (r+1)*ring) (device
+        page row == req_pool_idx). The host SWA pool is window-paged (one item
+        == one window), so the copy is page-granular via the pool transfer_kv.
+        """
+        windows = getattr(req, "_swa_restore_windows", None)
+        req._swa_restore_windows = None
+        if not windows:
+            return
+        hp = self._swa_kv_pool_host
+        if hp is None:
+            return
+        # ring size == host SWA pool page size (slot_page_size=swa_ring_size);
+        # avoids depending on a pool handle the cache does not expose.
+        ring = hp.slot_page_size
+        host_idx = torch.cat([hv.to(torch.int64) for _, hv in windows])
+        # Only the trailing `ring` tokens fit the per-request ring block; a
+        # page-aligned reuse window is exactly one host page (== ring tokens).
+        if host_idx.numel() != ring:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[LB-RESTORE] skip non-single-page window: host_tokens=%s ring=%s",
+                    int(host_idx.numel()),
+                    ring,
+                )
+            return
+        r = int(req_pool_idx)
+        base = r * ring
+        device_idx = torch.arange(
+            base, base + ring, dtype=torch.int64, device=hp.gpu_device
+        )
+        host_idx = host_idx.to(hp.gpu_device)
+        for li in range(hp.layer_num):
+            hp.load_to_device_per_layer(None, host_idx, device_idx, li, io_backend)
+        if _SWA_DBG_CHECKSUM and hasattr(self, "_dbg_verify_restore"):
+            for node, _ in windows:
+                self._dbg_verify_restore(node.component_data[self.component_type])
 
     def _gather_window_full_indices(
         self, node: UnifiedTreeNode, n_tokens: int

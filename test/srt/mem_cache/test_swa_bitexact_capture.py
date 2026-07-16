@@ -14,6 +14,7 @@ Covers:
     the restored SWA slots.
 """
 
+import os
 import types
 import unittest
 from array import array
@@ -26,7 +27,10 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+    SWAComponent,
+    _state_rides,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -670,6 +674,121 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
         # Skipped (device exists), and nothing else host-only above it in
         # this single-node chain -> no transfer at all.
         self.assertIsNone(transfers)
+
+
+class TestLoadBackMappingLengths(unittest.TestCase):
+    """S3 contract: commit_hicache_transfer(LOAD_BACK) must feed equal-length
+    index tensors to set_full_to_swa_mapping for every node. Correct device
+    allocation (device_indices == sum host_value) maps cleanly; a device
+    under-allocation raises the S3 diagnostic AssertionError with the exact
+    sizes (not the opaque allocator full==swa assert)."""
+
+    WIN = 128
+
+    def _me(self, mapping_calls):
+        allocator = types.SimpleNamespace(
+            set_full_to_swa_mapping=lambda full, swa: mapping_calls.append(
+                (int(full.numel()), int(swa.numel()))
+            )
+        )
+        root = types.SimpleNamespace(component_data={}, parent=None)
+        me = types.SimpleNamespace(
+            component_type=SWA,
+            _capture_rid=5,
+            _swa_kv_pool_host=None,
+            cache=types.SimpleNamespace(
+                token_to_kv_pool_allocator=allocator, root_node=root
+            ),
+            _restore_device_value=lambda n, v: None,
+        )
+        me._gather_window_full_indices = (
+            lambda n, nt: SWAComponent._gather_window_full_indices(me, n, nt)
+        )
+        return me, root
+
+    def _window_node(self, root, base):
+        # a page-boundary node: FULL value length == WIN, SWA host_value == WIN.
+        full_val = torch.arange(base, base + self.WIN, dtype=torch.int64)
+        return types.SimpleNamespace(
+            parent=root,
+            component_data={
+                SWA: _cd(value=None, host_value=torch.zeros(self.WIN, dtype=torch.int64)),
+                FULL: _cd(value=full_val),
+            },
+        )
+
+    def _xfer(self, nodes, device_len):
+        total = self.WIN * len(nodes)
+        return PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.zeros(total, dtype=torch.int64),
+            device_indices=torch.arange(device_len, dtype=torch.int64) + 900,
+            nodes_to_load=nodes,
+        )
+
+    def test_correct_alloc_multi_node_maps_equal_lengths(self):
+        mapping_calls = []
+        me, root = self._me(mapping_calls)
+        nodes = [self._window_node(root, 100), self._window_node(root, 300)]
+        xfer = self._xfer(nodes, device_len=self.WIN * len(nodes))
+        SWAComponent.commit_hicache_transfer(
+            me, nodes[-1], CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+        self.assertEqual(len(mapping_calls), 2)
+        for full_n, swa_n in mapping_calls:
+            self.assertEqual(full_n, swa_n)
+            self.assertEqual(full_n, self.WIN)
+
+    def test_device_under_allocation_raises_diagnostic(self):
+        mapping_calls = []
+        me, root = self._me(mapping_calls)
+        nodes = [self._window_node(root, 100), self._window_node(root, 300)]
+        # device_indices short by 64 for the 2nd node -> swa_chunk < window_full
+        xfer = self._xfer(nodes, device_len=self.WIN * len(nodes) - 64)
+        with self.assertRaises(AssertionError) as ctx:
+            SWAComponent.commit_hicache_transfer(
+                me, nodes[-1], CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+            )
+        msg = str(ctx.exception)
+        self.assertIn("index-length mismatch", msg)
+        self.assertIn("swa_chunk=64", msg)
+        self.assertIn("window_full=128", msg)
+
+
+class TestSwaOnlyDecouple(unittest.TestCase):
+    """SWA-only gate (S1): SGLANG_SWA_HICACHE_SWA_ONLY=1 -> _state_rides()==[]
+    so the SWA host reuse pipeline binds/reuses without the c4/indexer
+    compress-state co-lifetime. Gate off keeps the c4/indexer rides."""
+
+    def _fake_comp_with_rides(self):
+        return types.SimpleNamespace(
+            _c4_state_layer_index={0: 0},
+            _c4_state_host_pool=object(),
+            _c4_indexer_state_host_pool=object(),
+            _compress_state_pools=[object()],
+            _indexer_compress_state_pools=[object()],
+        )
+
+    def _with_env(self, val, fn):
+        key = "SGLANG_SWA_HICACHE_SWA_ONLY"
+        old = os.environ.get(key)
+        os.environ[key] = val
+        try:
+            return fn()
+        finally:
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    def test_state_rides_empty_under_swa_only(self):
+        comp = self._fake_comp_with_rides()
+        self.assertEqual(self._with_env("1", lambda: _state_rides(comp)), [])
+
+    def test_state_rides_present_when_gate_off(self):
+        comp = self._fake_comp_with_rides()
+        rides = self._with_env("0", lambda: _state_rides(comp))
+        self.assertGreaterEqual(len(rides), 1)
 
 
 if __name__ == "__main__":

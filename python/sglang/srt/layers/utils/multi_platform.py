@@ -80,6 +80,18 @@ class MultiPlatformOp(nn.Module):
     # Please do not override this method, because `self._forward_method` can change when in torch compile mode
     @debug_kernel_api
     def forward(self, *args, **kwargs):
+        try:
+            import logging as _l
+            _lg=_l.getLogger(__name__)
+            _nm=getattr(self._forward_method,"__qualname__",str(self._forward_method))
+            _cn=type(self).__name__
+            _k=f"{_cn}:{_nm}"
+            if not hasattr(MultiPlatformOp,"_dbg_seen"): MultiPlatformOp._dbg_seen=set()
+            if _k not in MultiPlatformOp._dbg_seen:
+                MultiPlatformOp._dbg_seen.add(_k)
+                _lg.warning("[DISPATCH-DBG] %s", _k)
+        except Exception:
+            pass
         return self._forward_method(*args, **kwargs)
 
     def forward_native(self, *args, **kwargs):

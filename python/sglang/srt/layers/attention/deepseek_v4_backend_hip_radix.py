@@ -1425,9 +1425,15 @@ class DeepseekV4HipRadixBackend(
                     hidx = host_pool.alloc(win)
                     if hidx is None:
                         # Host pool full: skip this boundary (reuse recomputes it).
+                        if _SWA_DBG_CHECKSUM and swa_layer == 0:
+                            logger.warning(
+                                "[CAP-DBG] SWA host pool FULL, skip key=%s", key
+                            )
                         B += page
                         continue
                     staging[key] = hidx
+                    if _SWA_DBG_CHECKSUM and swa_layer == 0:
+                        logger.warning("[CAP-DBG] SWA staged key=%s", key)
                 win_slice = kv[offset + (B - win - cs) : offset + (B - cs)]
                 assert (
                     win_slice.numel() * win_slice.element_size() == host_pool.item_bytes

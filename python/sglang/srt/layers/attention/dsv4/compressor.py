@@ -25,6 +25,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
+    KVAndScore,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -33,6 +34,15 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
+
+import logging as _cap_logging
+_CAP_DBG_LOGGER = _cap_logging.getLogger(__name__)
+_CAP_DBG_SEEN = set()
+def _cap_dbg(msg):
+    if msg not in _CAP_DBG_SEEN:
+        _CAP_DBG_SEEN.add(msg)
+        import sys as _sys
+        print("[STATECAP2] " + str(msg), file=_sys.stderr, flush=True)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -165,6 +175,7 @@ class CompressorBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
+        _cap_dbg(f"FCC layer={layer_id} ratio={compressor.ratio} mode={forward_batch.forward_mode}")
         token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -431,6 +442,137 @@ class Compressor(MultiPlatformOp):
             )
         return kv_score
 
+    @staticmethod
+    def _compute_state_len_indices(seq_len: int, ratio: int) -> torch.Tensor:
+        state_len = seq_len % ratio + (ratio == 4) * ratio
+        return torch.arange(seq_len - state_len, seq_len).clamp(min=-1)
+
+    def _capture_overlap_state_windows(
+        self,
+        attn_backend,
+        forward_batch,
+        kv_score_input: torch.Tensor,
+    ) -> None:
+        """Strict SWA HiCache: snapshot the c4 / c4-indexer overlap state
+        [B-ratio, B) at each page boundary B into the host state pool,
+        byte-identical to the retired CompressorHip.compress_extend_paged
+        capture. Sourced from the same pre-transform buffer
+        cat(pre_state, this-chunk kv_score) at the same point, so a reused
+        request restores exact state. No-op unless the bit-exact host state pool
+        is wired (flag on) and this is a ratio==4 prefill.
+        """
+        if self.ratio != 4:
+            _cap_dbg(f"ret ratio={self.ratio}!=4")
+            return
+        if not forward_batch.forward_mode.is_extend():
+            _cap_dbg(f"ret not extend {forward_batch.forward_mode}")
+            return
+        token_to_kv_pool = attn_backend.token_to_kv_pool
+        if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            return
+        attr = (
+            "_c4_indexer_state_host_pool"
+            if self.is_in_indexer
+            else "_c4_state_host_pool"
+        )
+        hp = getattr(token_to_kv_pool, attr, None)
+        if hp is None:
+            _cap_dbg(f"ret hp None {attr}")
+            return
+        layer_index = getattr(token_to_kv_pool, "_c4_state_layer_index", None)
+        if layer_index is None:
+            return
+        li = layer_index.get(self.layer_id)
+        if li is None:
+            _cap_dbg(f"ret li None layer={self.layer_id}")
+            return
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if prefix_lens is None or extend_lens is None:
+            return
+
+        state_pool = self.get_state_pool(attn_backend)
+        req_pool_indices = forward_batch.req_pool_indices
+        req_to_token = attn_backend.req_to_token_pool.req_to_token
+        device = kv_score_input.device
+        kv_and_scores = KVAndScore(kv_score_input)
+
+        page = attn_backend.page_size
+        swa_ring = token_to_kv_pool.unified_swa_ring_size
+        slot_page = hp.slot_page_size
+        if swa_ring % slot_page != 0 or page % swa_ring != 0:
+            raise AssertionError(
+                f"state capture geometry: page={page} swa_ring={swa_ring} "
+                f"ring_size={slot_page}"
+            )
+        win = self.ratio
+        slot_bytes = hp.item_bytes // slot_page
+        staging = hp._capture_staging
+        host_layer_buf = hp.data_refs[li]
+
+        bs = forward_batch.batch_size
+        pt = 0
+        for i in range(bs):
+            elen = int(extend_lens[i])
+            plen = int(prefix_lens[i])
+            if elen <= 0:
+                pt += elen
+                continue
+            rid = int(req_pool_indices[i])
+            kv_and_score = kv_and_scores[pt : pt + elen]
+            pt += elen
+
+            pre_state_indices = self._compute_state_len_indices(plen, self.ratio).to(
+                device
+            )
+            raw_loc = torch.where(
+                pre_state_indices < 0,
+                -1,
+                req_to_token[req_pool_indices[i], pre_state_indices],
+            )
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
+            state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
+            pre_kv_state = state_pool.get_state_by_state_loc(state_loc)
+            kv_and_score_buffer = KVAndScore.cat([pre_kv_state, kv_and_score], dim=0)
+            valid_kv_len = kv_and_score_buffer.kv.size(0)
+            state_buf = kv_and_score_buffer.kv_score
+            pre_len = valid_kv_len - elen
+
+            cs = plen
+            total = plen + elen
+            boundary = (total // page) * page
+            B = ((cs // page) + 1) * page
+            while B <= boundary:
+                off0 = ((B - win) % swa_ring) % slot_page
+                if B - win < cs or off0 + win > slot_page:
+                    raise AssertionError(
+                        f"state window out of range: B={B} win={win} cs={cs} "
+                        f"off0={off0} ring_size={slot_page}"
+                    )
+                key = (rid, int(B))
+                hidx = staging.get(key)
+                if hidx is None:
+                    hidx = hp.alloc(slot_page)
+                    if hidx is None:
+                        B += page
+                        continue
+                    staging[key] = hidx
+                    _cap_dbg(f"STAGED idx={self.is_in_indexer} key={key}")
+                buf_lo = pre_len + (B - win - plen)
+                buf_hi = pre_len + (B - plen)
+                win_slice = state_buf[buf_lo:buf_hi]
+                flat = win_slice.contiguous().view(torch.uint8).reshape(-1)
+                if flat.numel() != win * slot_bytes:
+                    raise AssertionError(
+                        f"state window bytes {flat.numel()} != {win * slot_bytes}"
+                    )
+                page_row = int(hidx[0].item()) // slot_page
+                dst = host_layer_buf[page_row]
+                dst[off0 * slot_bytes : off0 * slot_bytes + flat.numel()].copy_(
+                    flat, non_blocking=True
+                )
+                B += page
+
     def forward_native(
         self,
         x: torch.Tensor,
@@ -442,6 +584,9 @@ class Compressor(MultiPlatformOp):
             return x.new_empty(0, self.head_dim)
 
         kv_score = self.compute_kv_score(x, forward_batch)
+
+        _cap_dbg(f"FWDNATIVE ratio={self.ratio} idx={self.is_in_indexer} mode={forward_batch.forward_mode}")
+        self._capture_overlap_state_windows(attn_backend, forward_batch, kv_score)
 
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)

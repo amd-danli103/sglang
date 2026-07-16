@@ -42,6 +42,14 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
+
+import logging as _dv4_logging
+_DV4_LOGGER = _dv4_logging.getLogger(__name__)
+_DV4_DBG_SEEN = set()
+def _dv4_dbg(msg):
+    if msg not in _DV4_DBG_SEEN:
+        _DV4_DBG_SEEN.add(msg)
+        _DV4_LOGGER.warning("[PREP-DBG] %s", msg)
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
@@ -755,6 +763,7 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        _dv4_dbg(f"PREP plain layer={self.layer_id} ratio={self.compress_ratio} has_comp={self.compressor is not None}")
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -921,12 +930,14 @@ class MQALayer(nn.Module):
                 attn_backend=attn_backend,
             )
         if self.compressor is not None:
+            _dv4_dbg(f"CALLFCC pre layer={self.layer_id} ratio={self.compress_ratio}")
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
                 self.layer_id,
                 self.compressor,
             )
+            _dv4_dbg(f"CALLFCC post layer={self.layer_id}")
 
         return q, kv
 

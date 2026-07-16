@@ -2508,6 +2508,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    def restore_swa_windows(self, reqs, req_pool_indices_cpu):
+        """Deferred positional SWA restore (unified_kv), driven from
+        prepare_for_extend once req_pool_idx is assigned. For each req that
+        stashed a reuse window at load_back, copy the host SWA window into its
+        per-request unified_kv ring block before the first forward reads it."""
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is None or not getattr(swa_comp, "_unified_positional_swa", False):
+            return
+        if self.cache_controller is None:
+            return
+        io_backend = self.cache_controller.io_backend
+        idx = req_pool_indices_cpu.tolist()
+        for i, req in enumerate(reqs):
+            if getattr(req, "_swa_restore_windows", None):
+                swa_comp.restore_pending_swa_windows(req, int(idx[i]), io_backend)
+
     def init_load_back(
         self,
         params: InitLoadBackParams,

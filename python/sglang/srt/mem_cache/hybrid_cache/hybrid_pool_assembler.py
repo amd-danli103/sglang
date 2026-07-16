@@ -1429,6 +1429,9 @@ def _apply_stack_result(
     if result.swa_bit_exact and ComponentType.SWA in cache.components:
         swa_comp = cache.components[ComponentType.SWA]
         swa_comp._strict_bit_exact = True
+        # unified_kv: SWA device ring is positional; enable deferred
+        # positional restore (H->D at prepare_for_extend, after req_pool_idx).
+        swa_comp._unified_positional_swa = getattr(kvcache, "_unified_kv", False)
         # Wire the c4 / c4-indexer compress-state pools that ride the SWA node
         # (capture at prefill, restore on reuse). Absent -> state logic no-ops.
         swa_comp._c4_state_host_pool = getattr(kvcache, "_c4_state_host_pool", None)
