@@ -1601,18 +1601,6 @@ class _DeepSeekV4Strategy(StackStrategy):
                 "guarantee the SWA ring is offloaded before its slot is reused."
             )
 
-        if swa_bit_exact:
-            # The capture and restore halves of strict bit-exact SWA reuse land
-            # in later parts of this stack. A window restored without the
-            # c4/indexer state it was captured with is worse than a recomputed
-            # one -- the compressor would run against an antecedent the original
-            # prefill never used -- so until the last part is in, refuse to
-            # start rather than serve reuse that is silently not bit-exact.
-            raise ValueError(
-                "SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE is not usable yet: the SWA "
-                "capture/restore path is not fully wired."
-            )
-
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
             server_args=server_args,

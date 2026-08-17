@@ -2,8 +2,7 @@
 
 Covers the strict bit-exact SWA HiCache logic:
   * sizing: hybrid_pool_assembler._swa_host_num_pages and its host-DRAM budget
-  * startup guards: the write-through requirement and the temporary gate that
-    refuses to boot while the capture/restore halves are unwired
+  * startup guards: the write-through requirement
   * co-eviction observability: UnifiedRadixCache._note_binding_full_coevict
   * strict atomic leaf eviction: UnifiedTreeCore.drive_host_leaf_eviction
     and SWAComponent.drive_host_eviction routing
@@ -379,13 +378,13 @@ class TestWriteBackGuard(unittest.TestCase):
             self._build(unified=False, write_policy="write_back", flag=True)
         self.assertNotIn("requires --hicache-write-policy", str(ctx.exception))
 
-    def test_flag_on_refuses_to_start_while_unwired(self):
-        # Past the write-policy guard nothing else stands between the flag and a
-        # half-wired reuse path, so enabling it must refuse to boot until the
-        # capture and restore halves are in.
-        with self.assertRaises(ValueError) as ctx:
+    def test_flag_on_is_no_longer_gated(self):
+        # The gate that refused to boot while capture/restore were unwired is
+        # gone now that both halves are in: the build must get past it and fail
+        # only on the faked collaborators.
+        with self.assertRaises(Exception) as ctx:
             self._build(unified=True, write_policy="write_through", flag=True)
-        self.assertIn("not usable yet", str(ctx.exception))
+        self.assertNotIn("not usable yet", str(ctx.exception))
 
 
 class TestSwaRegionBuffers(unittest.TestCase):

@@ -59,6 +59,380 @@ logger = logging.getLogger(__name__)
 _SWA_DBG_CHECKSUM = os.environ.get("SGLANG_SWA_DBG_CHECKSUM") == "1"
 
 
+# c4 / c4-indexer overlap compress-state riding.
+#
+# A captured SWA window is only bit-exact on reuse if the c4 overlap state at the
+# reuse page boundary [B-ratio, B) is restored along with it: c4 compression reads
+# the prior group's raw KV/score at every boundary, and the device state ring only
+# holds the latest few groups, so a reusing request would otherwise read another
+# request's slot. The non-strict path masks that with tail reprefill; the strict
+# path cannot. So each SWA carrier co-owns the attn + indexer state tiles captured
+# at the same (rid, B), and they ride the window's whole lifetime:
+# bind -> BACKUP_HOST promote -> LOAD_BACK restore -> free.
+#
+# Module-level functions taking the component as first arg so fakes can drive them
+# in unit tests. Each ride tuple is
+#   (host_pool, device_state_pools, node_host_value_attr, node_pending_attr, li_map)
+
+# (host_pool attr, device state-pool list attr, node host-value attr,
+#  node pending attr)
+_STATE_RIDE_SPECS = (
+    (
+        "_c4_state_host_pool",
+        "_compress_state_pools",
+        "_c4_state_host_value",
+        "_c4_state_pending_host",
+    ),
+    (
+        "_c4_indexer_state_host_pool",
+        "_indexer_compress_state_pools",
+        "_c4_indexer_state_host_value",
+        "_c4_indexer_state_pending_host",
+    ),
+)
+
+
+def _state_rides(component):
+    """Active c4 overlap-state rides (attn + indexer). Empty (``[]``) unless the
+    strict state offload has been wired onto ``component``."""
+    rides = []
+    li_map = getattr(component, "_c4_state_layer_index", None)
+    if li_map is None:
+        return rides
+    for host_attr, pools_attr, host_value_attr, pending_attr in _STATE_RIDE_SPECS:
+        hp = getattr(component, host_attr, None)
+        pools = getattr(component, pools_attr, None)
+        if hp is not None and pools is not None:
+            rides.append((hp, pools, host_value_attr, pending_attr, li_map))
+    return rides
+
+
+def _bind_state_rides(component, node, rid: int, B: int) -> bool:
+    """Atomically claim the state tiles captured at (rid, B) as pending refs on node
+    (co-lifetime with the SWA window). Returns True if every active ride's tile
+    was present (or no ride is wired); on a partial miss it rolls back the popped
+    tiles and returns False.
+
+    Callers offload the SWA window regardless of this result: a state-less window
+    is kept and just excluded from the strict reuse boundary by the match
+    validator. The atomicity here only prevents leaving one ride's tile popped
+    while the other is missing; it does not gate offload. This keeps partial-
+    prefix reuse working while still preventing the dirty read, since a state-less
+    boundary is never crossed on reuse.
+    """
+    rides = _state_rides(component)
+    if not rides:
+        return True
+    popped = []
+    for hp, _pools, _hv_attr, _pending_attr, _li in rides:
+        staging = getattr(hp, "_capture_staging", None)
+        h = staging.pop((rid, int(B)), None) if staging else None
+        if h is None:
+            for _hp, _v in popped:
+                _hp.free(_v)
+            _n = getattr(hp, "_bind_miss_dbg", 0) + 1
+            hp._bind_miss_dbg = _n
+            if _n & (_n - 1) == 0:
+                _keys = list(staging.keys())[:8] if staging else []
+                logger.warning(
+                    "[BIND-MISS] want=(%s,%d) miss#%d staging_n=%d sample_keys=%s",
+                    rid,
+                    int(B),
+                    _n,
+                    len(staging) if staging else 0,
+                    _keys,
+                )
+            return False
+        popped.append((hp, h.to(torch.int64)))
+    # The boundary the tiles were captured at; restore needs it to address the
+    # reusing request's ring rows by position.
+    node._swa_state_B = int(B)
+    for (hp, v), (_hp, _pools, host_value_attr, pending_attr, li_map) in zip(
+        popped, rides
+    ):
+        setattr(node, pending_attr, v)
+        if _SWA_DBG_CHECKSUM:
+            crc_src = getattr(hp, "_capture_state_crc", None)
+            if crc_src is not None:
+                setattr(
+                    node,
+                    host_value_attr + "_crc",
+                    {
+                        li: crc_src.pop((rid, int(B), li), None)
+                        for li in li_map.values()
+                    },
+                )
+    return True
+
+
+def _node_swa_page_row(component, node):
+    """The node's SWA window host page row (the durable state index), or None when
+    the SWA host_value is not set / no host pool wired."""
+    hp = getattr(component, "_swa_kv_pool_host", None)
+    if hp is None:
+        return None
+    cd = node.component_data[component.component_type]
+    hv = getattr(cd, "host_value", None)
+    if hv is None or len(hv) == 0:
+        return None
+    return int(hv[0].item()) // hp.slot_page_size
+
+
+def _state_durable_indices(hp, swa_page_row):
+    """Token indices addressing state pool durable row ``swa_page_row`` (so
+    ``_restore_state_windows``'s ``host_value[0] // ring`` recovers the row)."""
+    ring = hp.slot_page_size
+    return torch.arange(
+        swa_page_row * ring, swa_page_row * ring + ring, dtype=torch.int64
+    )
+
+
+def _promote_state_pending(component, node) -> None:
+    """Adopt the pending state tiles as durable host values, together with the SWA
+    host_value at the coordinated BACKUP_HOST commit (co-lifetime).
+
+    When the state pool reserves a durable region, move the staged tile into the
+    SWA window's coupled durable row (promote_captured_page) and record host_value
+    as that durable row's indices, so the state sits in its own L3 pool at the same
+    row as the SWA window and rides the same coupled key family. With no reserve,
+    adopt the staged page as-is.
+    """
+    swa_row = None
+    for hp, _pools, host_value_attr, pending_attr, _li in _state_rides(component):
+        pend = getattr(node, pending_attr, None)
+        if pend is None:
+            continue
+        reserve = int(getattr(hp, "_durable_reserve_slots", 0) or 0)
+        if reserve and hasattr(hp, "promote_captured_page"):
+            if swa_row is None:
+                swa_row = _node_swa_page_row(component, node)
+            if swa_row is None:
+                # A durable region is reserved but the coupled SWA window row is unknown
+                # (its host_value must be attached before promote). NEVER adopt
+                # the transient slack page as a durable host_value: the allocator
+                # can hand that slot to another in-flight capture -> stale/dirty
+                # read on restore. Drop the binding instead (state recomputes on
+                # reuse); an orphaned durable-less window is correct, just cold.
+                logger.warning(
+                    "[SWA-HiCache] promote skipped: no SWA window row for node "
+                    "%s; dropping staged state tile (recompute on reuse).",
+                    getattr(node, "id", id(node)),
+                )
+                hp.free(pend)
+                setattr(node, pending_attr, None)
+                setattr(node, host_value_attr, None)
+                continue
+            hp.promote_captured_page(pend, swa_row)
+            setattr(node, host_value_attr, _state_durable_indices(hp, swa_row))
+            setattr(node, pending_attr, None)
+            continue
+        # Legacy single-region pool (no durable reserve): adopt the staged page.
+        setattr(node, host_value_attr, pend)
+        setattr(node, pending_attr, None)
+
+
+def _attach_state_durable_row(component, node, swa_slice, B: int) -> None:
+    """L3 reuse: the c4/indexer state page rode this window's key family
+    (independent-pool sidecar, ``indices_from_pool=SWA``) and was written into the
+    coupled durable row by ``set_from_flat_data_page`` on prefetch. Point the
+    carrier's state host_value at that durable row (``swa_row``, the same row the
+    L3 sidecar addressed via ``_l3_page_size``) so ``restore_pending_swa_windows``
+    restores it bit-exact. No-op unless a state ride with a durable region is
+    wired."""
+    hp0 = getattr(component, "_swa_kv_pool_host", None)
+    if hp0 is None:
+        return
+    if swa_slice is None or len(swa_slice) == 0:
+        return
+    # Only pools with a reserved durable region are addressed by SWA row. Resolve
+    # them before touching hp0's ring geometry: without a ride there is nothing to
+    # address, and the SWA host pool need not be a row-paged one at all.
+    durable = [
+        (hp, host_value_attr)
+        for hp, _pools, host_value_attr, _pending, _li in _state_rides(component)
+        if int(getattr(hp, "_durable_reserve_slots", 0) or 0)
+    ]
+    if not durable:
+        return
+    swa_row = int(swa_slice[0].item()) // hp0.slot_page_size
+    node._swa_state_B = int(B)
+    for hp, host_value_attr in durable:
+        setattr(node, host_value_attr, _state_durable_indices(hp, swa_row))
+
+
+def _free_state_bindings(component, node) -> None:
+    """Release both pending and durable state tiles back to their host pools (SWA
+    carrier dropped without a durable host backup, or node removed)."""
+    node._swa_state_B = None
+    for hp, _pools, host_value_attr, pending_attr, _li in _state_rides(component):
+        for attr in (pending_attr, host_value_attr):
+            v = getattr(node, attr, None)
+            if v is not None:
+                hp.free(v)
+                setattr(node, attr, None)
+        if (
+            _SWA_DBG_CHECKSUM
+            and getattr(node, host_value_attr + "_crc", None) is not None
+        ):
+            setattr(node, host_value_attr + "_crc", None)
+
+
+def _state_locs_for_window(sp, swa_chunk, swa_ring, B, ratio):
+    """Device state rows holding the boundary group ``[B-ratio, B)`` of a restored
+    ring block.
+
+    These must be the rows the compressor will read, and it addresses c4 state
+    from the SWA slot (see ``_c4_state_overlap_prefix``: req_to_token -> full to
+    swa -> swa_loc to state_loc). At restore time the reusing request's
+    req_to_token is not populated for these positions yet, so the slot comes from
+    the restored block instead. The block is in ring order, so it must be indexed
+    by position rather than by taking its trailing ``ratio`` slots: those coincide
+    only when ``B % swa_ring == 0``, which speculative decode breaks by sizing the
+    ring as sliding_window + num_draft_tokens - 1.
+
+    If the base ever re-addresses c4 state by (request, position) -- the contract
+    c128 already uses -- this is the one place to switch, and the address-contract
+    test fails until it is.
+    """
+    pos = torch.arange(B - ratio, B, dtype=torch.int64, device=swa_chunk.device)
+    return sp.translate_from_swa_loc_to_state_loc(swa_chunk[pos % swa_ring])
+
+
+def _restore_state_ride_per_layer(
+    node,
+    hp,
+    pools,
+    layers,
+    host_value_attr,
+    swa_chunk,
+    swa_ring,
+    B,
+    page_row,
+    slot_bytes,
+    off0,
+) -> None:
+    """One blocking H2D per layer, each layer with its own window width."""
+    for layer_id, li in layers:
+        sp = pools[layer_id]
+        ratio = sp.ratio
+        if B < ratio:
+            continue
+        state_locs = _state_locs_for_window(sp, swa_chunk, swa_ring, B, ratio)
+        dev = sp.kv_score_buffer.kv_score
+        host_tile = hp.data_refs[li][page_row]
+        flat = host_tile[off0 * slot_bytes : (off0 + ratio) * slot_bytes]
+        # the blocking .to() is load-bearing: an all-layer non_blocking transfer
+        # keeps reading the tile after the call, and a concurrent promote / L3
+        # fetch overwrites it mid-DMA -- host CRC still matches, only the device
+        # rows are wrong
+        window = flat.view(dev.dtype).reshape(ratio, -1).to(device=dev.device)
+        dev[state_locs] = window
+        if _SWA_DBG_CHECKSUM:
+            _dbg_verify_state_restore(
+                node, host_value_attr, hp, li, page_row, off0, flat, dev, state_locs
+            )
+
+
+def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
+    """Restore the c4 / c4-indexer overlap state for the reused window onto the
+    device state ring, so the reusing request's boundary read is bit-exact.
+
+    swa_chunk is the whole restored ring block for this request, in ring order:
+    swa_chunk[j] is the slot holding every position p with p % swa_ring == j. The
+    host tile packs the boundary group [B-ratio, B) in token order at off0=0, so
+    the destination rows must be looked up by position, not taken from the tail of
+    the block -- those coincide only when B % swa_ring == 0, which speculative
+    decode breaks (it sizes the ring as sliding_window + num_draft_tokens - 1, so
+    the ring no longer divides the page). Each slot's device state row is
+    translate_from_swa_loc_to_state_loc(slot), so the captured window lands on the
+    exact rows the compressor will read regardless of the reusing request's base.
+    """
+    rides = _state_rides(component)
+    if not rides:
+        return
+    swa_ring = swa_chunk.numel()
+    B = getattr(node, "_swa_state_B", None)
+    for hp, pools, host_value_attr, _pending_attr, li_map in rides:
+        host_value = getattr(node, host_value_attr, None)
+        if host_value is None:
+            continue
+        if B is None:
+            # Cannot address the destination rows without the boundary; restoring
+            # to a guessed row would be a silent bit-exactness break, so leave the
+            # ring alone and let the boundary recompute.
+            logger.warning(
+                "[SWA-HiCache] state restore skipped: no boundary recorded for "
+                "node %s (attr=%s); boundary will recompute.",
+                getattr(node, "id", id(node)),
+                host_value_attr,
+            )
+            continue
+        ring = hp.slot_page_size
+        slot_bytes = hp.item_bytes // ring
+        page_row = int(host_value[0].item()) // ring
+        off0 = 0  # pack at tile start; must match capture off0=0
+        layers = [
+            (layer_id, li)
+            for layer_id, li in li_map.items()
+            if layer_id < len(pools) and pools[layer_id] is not None
+        ]
+        if not layers:
+            continue
+        _restore_state_ride_per_layer(
+            node,
+            hp,
+            pools,
+            layers,
+            host_value_attr,
+            swa_chunk,
+            swa_ring,
+            B,
+            page_row,
+            slot_bytes,
+            off0,
+        )
+
+
+def _dbg_verify_state_restore(
+    node, host_value_attr, hp, li_local, page_row, off0, flat, dev, state_locs
+):
+    """Gated (SGLANG_SWA_DBG_CHECKSUM) double-ended check for one c4 state ride layer.
+    (a) host round-trip: the bound tile bytes still match the position-weighted CRC
+    taken at capture, proving capture/bind/promote/restore kept the exact tile at
+    the exact page_row/off0. (b) device landing: the rows just written match the
+    host window, proving the write hit the intended state ring rows (catches
+    state_locs collisions / out-of-range). Immune to model non-determinism;
+    localizes any mismatch to layer/page_row/off0/state_locs.
+    """
+    idx = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64) + 1
+    got_host = int((flat.to(torch.int64) * idx).sum().item())
+    crc_all = getattr(node, host_value_attr + "_crc", None)
+    exp = crc_all.get(li_local) if crc_all else None
+    if exp is not None and got_host != exp:
+        raise AssertionError(
+            f"[C4-STATE-DBG] host round-trip CRC mismatch attr={host_value_attr} "
+            f"li_local={li_local} page_row={page_row} off0={off0} "
+            f"expected={exp} got={got_host}"
+        )
+    back = dev[state_locs].contiguous().view(torch.uint8).reshape(-1)
+    bidx = torch.arange(back.numel(), device=back.device, dtype=torch.int64) + 1
+    got_dev = int((back.to(torch.int64) * bidx).sum().item())
+    if got_dev != got_host:
+        raise AssertionError(
+            f"[C4-STATE-DBG] device landing mismatch attr={host_value_attr} "
+            f"li_local={li_local} page_row={page_row} off0={off0} "
+            f"state_locs={state_locs.tolist()} host={got_host} dev={got_dev}"
+        )
+    _n = getattr(hp, "_dbg_state_verified", 0) + 1
+    hp._dbg_state_verified = _n
+    if _n <= 5 or _n % 200 == 0:
+        logger.warning(
+            "[C4-STATE-DBG] state ride bit-exact: %d layer-windows (attr=%s)",
+            _n,
+            host_value_attr,
+        )
+
+
 class SWAComponent(TreeComponent):
     """Sliding window attention component.
 
@@ -224,10 +598,14 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         strict_bit_exact = self._strict_bit_exact
         # Reuse correctness comes from this runtime clamp rather than an
-        # insert-time SWA>=Full guard: a node without a durable SWA host copy
-        # resets the running window length so the boundary clamps to the nearest
-        # page that has one. Under stride>1 a page can hold a Full host copy but
-        # no SWA window, which is a normal non-reuse boundary.
+        # insert-time SWA>=Full guard: a node without a durable SWA host copy, or
+        # without its c4/c4-indexer overlap state, resets the running window
+        # length so the boundary clamps to the nearest page that has both. Under
+        # stride>1 a page can hold a Full host copy but no SWA window, which is a
+        # normal non-reuse boundary. Empty when state riding is unwired.
+        state_ride_attrs = tuple(
+            hv_attr for (_hp, _pools, hv_attr, _pend, _li) in _state_rides(self)
+        )
         state = {"len": float("inf")}
 
         # unified_kv never caches the SWA ring (per-request, not content-stable),
@@ -263,7 +641,14 @@ class SWAComponent(TreeComponent):
             # serving a stale ring. The device-only match must still report the
             # request's own freshly-computed nodes as resident, else the self-match
             # returns empty device indices.
-            if strict_bit_exact and not match_device_only and cd.host_value is None:
+            missing_state = bool(state_ride_attrs) and any(
+                getattr(node, a, None) is None for a in state_ride_attrs
+            )
+            if (
+                strict_bit_exact
+                and not match_device_only
+                and (cd.host_value is None or missing_state)
+            ):
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
@@ -636,6 +1021,9 @@ class SWAComponent(TreeComponent):
                 if self._swa_kv_pool_host is not None:
                     self._swa_kv_pool_host.free(pending)
                 node._swa_pending_host = None
+                # Co-lifetime: the pending state tiles die with the SWA pending
+                # window (never promoted -> node degrades to recompute).
+                _free_state_bindings(self, node)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[ct]
@@ -643,6 +1031,10 @@ class SWAComponent(TreeComponent):
             host_freed = len(cd.host_value)
             host_frees[ct].append(cd.host_value)
             cd.host_value = None
+            # Co-lifetime: the durable host state tiles die with the SWA host
+            # window on host eviction (L1-only state scope; L3 state persistence
+            # is a later phase).
+            _free_state_bindings(self, node)
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
 
@@ -670,6 +1062,7 @@ class SWAComponent(TreeComponent):
             if self._swa_kv_pool_host is not None:
                 self._swa_kv_pool_host.free(pending)
             node._swa_pending_host = None
+            _free_state_bindings(self, node)
 
         return freed, host_freed
 
@@ -1150,6 +1543,10 @@ class SWAComponent(TreeComponent):
                     # Adopted the pre-staged capture page; ownership now held by
                     # host_value (same page) -> drop the pending ref.
                     node._swa_pending_host = None
+                # Co-lifetime: promote the ridden c4/c4-indexer state tiles to
+                # durable host values together with the SWA host_value (never
+                # before), so the state and its window share one host lifetime.
+                _promote_state_pending(self, node)
             # If the owning request finished while this host backup was still in
             # flight (host_value was None at cache_finished_req, so
             # evict_device_on_owner_release deferred the device free), drop the
@@ -1319,6 +1716,14 @@ class SWAComponent(TreeComponent):
             return
         # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
         node._swa_pending_host = host_value
+        # Claim the c4/c4-indexer overlap-state tiles at the same (rid, node_end)
+        # when present, but never drop the SWA window when they are missing: the
+        # window rides on its own, and create_match_validator keeps a state-less
+        # boundary out of the strict reuse boundary, clamping to the nearest
+        # window+state boundary instead. Dropping every state-less interior window
+        # here collapsed partial-prefix reuse to zero. No-op when strict state
+        # offload is unwired.
+        _bind_state_rides(self, node, rid, int(node_end))
         if _SWA_DBG_CHECKSUM:
             crc_map = getattr(hp, "_capture_crc", None)
             if crc_map:
@@ -1389,6 +1794,12 @@ class SWAComponent(TreeComponent):
                 action is None
             ), "interior SWA carrier cannot be write-through-pending"
             new_parent._swa_pending_host = host_value
+            # Claim the interior carrier's state tiles at (rid, B) when present, but
+            # keep the SWA window even on a miss: the match validator excludes a
+            # state-less interior boundary from the strict reuse boundary. Dropping
+            # the window here zeroed partial-prefix reuse, since interior state is
+            # evicted or exhausted far more often than the chunk tail.
+            _bind_state_rides(self, new_parent, rid, B)
             # Mark as an interior stride carrier: its captured page lifetime tracks
             # the Full component and is dropped only at true node removal, not the
             # SWA device ring, which is always recycled out-of-window before the
@@ -1495,6 +1906,9 @@ class SWAComponent(TreeComponent):
             if self._swa_kv_pool_host is not None:
                 self._swa_kv_pool_host.free(pending)
             node._swa_pending_host = None
+        # Node truly leaving the tree: release any ridden c4/c4-indexer state
+        # tiles (pending or durable host) so the state host pools don't leak.
+        _free_state_bindings(self, node)
 
     def cleanup_after_caching_req(
         self,
@@ -1516,7 +1930,13 @@ class SWAComponent(TreeComponent):
         self._capture_rid = None
         if rid is None:
             return
+        # Sweep the SWA pool and every state ride pool: each owns its own staging
+        # dict, and most staged state tiles are never claimed (only page
+        # boundaries that become node boundaries get bound), so skipping the ride
+        # pools here exhausts their slack region and silently drops every boundary
+        # out of strict reuse.
         pools = [self._swa_kv_pool_host]
+        pools += [hp for hp, _p, _hv, _pend, _li in _state_rides(self)]
         for hp in pools:
             if hp is None:
                 continue
@@ -1524,7 +1944,7 @@ class SWAComponent(TreeComponent):
             if staging:
                 for k in [k for k in staging if k[0] == rid]:
                     hp.free(staging.pop(k))
-            for crc_attr in ("_capture_crc",):
+            for crc_attr in ("_capture_crc", "_capture_state_crc"):
                 crc_map = getattr(hp, crc_attr, None)
                 if crc_map:
                     for k in [k for k in crc_map if k[0] == rid]:
@@ -1604,6 +2024,16 @@ class SWAComponent(TreeComponent):
         else:
             for li in range(hp.layer_num):
                 hp.load_to_device_per_layer(None, host_idx, device_idx, li, io_backend)
+        # Ride the c4/c4-indexer overlap state back onto the device state ring for
+        # this reused window; device_idx is the restored ring block, indexed by
+        # position to find the boundary group. Wait on each state pool's own
+        # capture-done event first, mirroring the SWA wait above. No-op when state
+        # offload is unwired or the node carries no state host value.
+        for _shp, _spools, _shv, _spend, _sli in _state_rides(self):
+            if hasattr(_shp, "wait_capture_done"):
+                _shp.wait_capture_done()
+        for _wnode, _ in windows:
+            _restore_state_windows(self, _wnode, device_idx)
         if _SWA_DBG_CHECKSUM:
             if hasattr(self, "_dbg_verify_restore"):
                 for node, _ in windows:
@@ -1826,6 +2256,9 @@ class SWAComponent(TreeComponent):
             cd_t = target.component_data[ct]
             if window_require_pages == 1 and cd_t.host_value is None:
                 self._attach_swa_host_value(target, host_indices)
+                _attach_state_durable_row(
+                    self, target, host_indices, insert_result.total_len
+                )
             else:
                 # Already present, or an unexpected multi-window buffer: fail-safe
                 # (recompute) -- never crash, never attach a desynced window.
@@ -1855,6 +2288,10 @@ class SWAComponent(TreeComponent):
                     if action is not None:
                         cache_actions.append(action)
                 self._attach_swa_host_value(cur, slice_)
+                # Independent-pool sidecar: the c4/indexer state rode this
+                # window's coupled key family into the SAME durable row; point the
+                # carrier at it so the reuse restores state (bit-exact boundary).
+                _attach_state_durable_row(self, cur, slice_, pos)
             else:
                 # Already has SWA (or empty overlap): drop this slice.
                 self._release_swa_host(slice_, cache_actions)
