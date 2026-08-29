@@ -156,6 +156,8 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        fp8_2buff: bool = False,
+        kv_cache_rope: Optional[torch.Tensor] = None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -197,6 +199,8 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
+            fp8_2buff=fp8_2buff,
+            kvcache_rope=kv_cache_rope,
         )
 
     def forward_unified(
@@ -215,6 +219,7 @@ class CompressorBackendMixin:
 
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
         )
 
@@ -223,6 +228,8 @@ class CompressorBackendMixin:
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
         )
         bf16_store = False
+        fp8_2buff = False
+        kv_cache_rope = None
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
@@ -233,7 +240,11 @@ class CompressorBackendMixin:
                 self.forward_metadata.core_metadata.unified,
                 f"c{compressor.ratio}_out_loc",
             )
-            bf16_store = True
+            if is_unified_kv_fp8():
+                fp8_2buff = True
+                kv_cache_rope = token_to_kv_pool.get_unified_kv_rope(layer_id)
+            else:
+                bf16_store = True
         else:
             _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
             assert compress_kv_pool is not None
@@ -256,6 +267,10 @@ class CompressorBackendMixin:
             out_loc=out_loc,
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
+            fp8_2buff=fp8_2buff,
+            kv_cache_rope=(
+                None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
+            ),
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
