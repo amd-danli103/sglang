@@ -156,6 +156,62 @@ def test_v32_rope_first_quant_matches_reference(batch):
 # ----------------------------------------------------------------------------
 # Strided weight (the non-contiguous wk slice) matches contiguous (V4 path).
 # ----------------------------------------------------------------------------
+def _rocm_v4_op_available():
+    # the ROCm wrapper goes straight to the AOT op; wheels built before the dsv4
+    # kernels landed do not carry it, and there is no JIT fallback on this path
+    return _is_hip and hasattr(
+        torch.ops.sgl_kernel, "dsv4_fused_q_indexer_rope_hadamard_quant"
+    )
+
+
+@pytest.mark.skipif(not _is_hip, reason="covers the ROCm-only software fp8 cast")
+def test_v4_rope_hadamard_quant_matches_reference_rocm():
+    """Same check as the CUDA one, against the AOT kernel this path uses on ROCm.
+
+    Its quant goes through a hand-written float -> e4m3 cast, and nothing else under
+    test/ reaches that copy: the tests above skip HIP outright. It writes NaN if the
+    cast's subnormal shift guard is loose, which isfinite below is here to catch.
+
+    int32 positions only -- the AOT entry TORCH_CHECKs for it, unlike the JIT one.
+    """
+    if not _rocm_v4_op_available():
+        pytest.skip("installed sgl_kernel has no dsv4 indexer op")
+    dev = "cuda"
+    batch = 64
+    g = torch.Generator(device=dev).manual_seed(0)
+    q = torch.randn(
+        batch, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=g
+    )
+    weight = torch.randn(batch, N_HEADS, dtype=torch.bfloat16, device=dev, generator=g)
+    weight_scale = 0.137
+    angles = torch.rand(MAX_POS, HALF, device=dev, generator=g) * 6.2831853
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)
+    positions = torch.randint(
+        0, 4096, (batch,), device=dev, dtype=torch.int32, generator=g
+    )
+
+    q_fp8, weights_out = fused_q_indexer_rope_hadamard_quant(
+        q, weight, weight_scale, freqs_cis, positions
+    )
+    torch.cuda.synchronize()
+
+    qf = q.float()
+    fc = freqs_cis[positions.long()]
+    cos = fc.real[:, None, :]
+    sin = fc.imag[:, None, :]
+    tail = qf[..., ROPE_DIM:]
+    re, im = tail[..., 0::2], tail[..., 1::2]
+    ntail = torch.stack([re * cos - im * sin, re * sin + im * cos], dim=-1).flatten(-2)
+    qrot = torch.cat([qf[..., :ROPE_DIM], ntail], dim=-1)
+    y = torch.matmul(qrot, _hadamard_matrix(HEAD_DIM, dev)) * (HEAD_DIM**-0.5)
+    scale = torch.clamp(y.abs().amax(dim=-1, keepdim=True), min=1e-4) / FP8_MAX
+
+    w_ref = weight.float() * weight_scale * scale.squeeze(-1)
+    torch.testing.assert_close(weights_out.squeeze(-1), w_ref, atol=1e-3, rtol=1e-3)
+    assert _fp8_dequant_ok(q_fp8, y, scale), "fp8 dequant error out of tolerance"
+    assert torch.isfinite(q_fp8.float()).all() and torch.isfinite(weights_out).all()
+
+
 def test_v4_strided_weight_matches_contiguous():
     _skip_if_unavailable()
     dev = "cuda"

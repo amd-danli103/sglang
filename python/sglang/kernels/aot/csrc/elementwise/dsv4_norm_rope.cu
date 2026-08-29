@@ -129,7 +129,10 @@ __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
   return __nv_fp8x2_e4m3(float2{x, y});
 }
 #else
-// Software float -> FP8 E4M3 conversion for ROCm
+// Software float -> FP8 E4M3 conversion for ROCm. Hardcoded E4M3FN (448 / 0x7E) on every
+// arch; the JIT copy in deepseek_v4/fp8_utils.cuh switches on HIP_FP8_TYPE_FNUZ instead.
+// Right for the indexer caller (allocates float8_e4m3fn), unverified for the flashmla one
+// (writes raw bytes into the packed cache) -- if gfx942 ever runs it, check that first.
 __device__ __forceinline__ uint8_t cvt_float_to_fp8_e4m3(float val) {
   constexpr float kMax = kFP8Max;
   val = fmaxf(fminf(val, kMax), -kMax);
@@ -148,15 +151,19 @@ __device__ __forceinline__ uint8_t cvt_float_to_fp8_e4m3(float val) {
   if (exp8 <= 0) {
     mant32 |= 0x800000u;
     int32_t shift = 1 - exp8;
-    if (shift > 24) return sign;
+    // shift 4 (exp32 -10) is the last binade that can round up to the min subnormal, so
+    // everything past it converts to zero. has to stay this tight: from shift 12 the
+    // shifts below run off the end of a uint32, and that UB lets -O2 escape the mask --
+    // measured NaN and |v| up to 0.44 out of gfx950, not just the wrapped low nibble
+    if (shift > 4) return sign;
     uint32_t shifted = mant32 >> (20 + shift);
     uint32_t rbit = (shift <= 23) ? ((mant32 >> (19 + shift)) & 1u) : 0u;
     uint32_t sbit = (shift <= 23) ? ((mant32 & ((1u << (19 + shift)) - 1u)) != 0) : 0u;
     shifted += (rbit && (sbit || (shifted & 1u)));
-    return sign | static_cast<uint8_t>(shifted & 0x7u);
+    // rounding out of the top of the subnormal range carries into the exponent field,
+    // so it has to survive the mask -- &0x7 wrote the min normal (2^-6) out as zero
+    return sign | static_cast<uint8_t>(shifted & 0xFu);
   }
-  if (exp8 >= 15) return sign | 0x7Eu;
-
   uint32_t mant3 = (mant32 >> 20) & 0x7u;
   uint32_t rbit = (mant32 >> 19) & 1u;
   uint32_t sbit = (mant32 & 0x7FFFFu) != 0;
@@ -164,8 +171,10 @@ __device__ __forceinline__ uint8_t cvt_float_to_fp8_e4m3(float val) {
   if (mant3 > 7) {
     mant3 = 0;
     exp8++;
-    if (exp8 >= 15) return sign | 0x7Eu;
   }
+  // Only 0_1111_111 is NaN, so exp8 == 15 is representable up to mant 6 -- testing
+  // exp8 >= 15 alone wrote every value in [256, 448] out as 448.
+  if (exp8 > 15 || (exp8 == 15 && mant3 > 6)) return sign | 0x7Eu;
   return sign | (static_cast<uint8_t>(exp8) << 3) | static_cast<uint8_t>(mant3);
 }
 
