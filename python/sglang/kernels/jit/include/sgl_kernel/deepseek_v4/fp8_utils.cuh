@@ -63,6 +63,7 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   constexpr int32_t kMinSubnormExp = -10;  // min subnormal exponent
   constexpr int32_t kMinNormExp = -7;      // min normal exponent
   constexpr uint8_t kSaturate = 0x7Fu;     // max normal = 0_1111_111 = 240.0
+  constexpr uint8_t kMaxMant = 7;
 #else
   // E4M3FN: bias=7, max=448, NaN=0x7F
   constexpr int32_t kBias = 7;
@@ -70,12 +71,18 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   constexpr int32_t kMinSubnormExp = -9;
   constexpr int32_t kMinNormExp = -6;
   constexpr uint8_t kSaturate = 0x7Eu;  // max normal = 0_1111_110 = 448.0
+  constexpr uint8_t kMaxMant = 6;       // 0_1111_111 is NaN in E4M3FN
 #endif
 
   int32_t exp8;
   uint8_t mant3;
 
   if (exp32 < kMinSubnormExp) {
+    // The binade right below the min subnormal is not underflow: 2^kMinSubnormExp is
+    // 1 ulp and its midpoint is the bottom of that binade, so anything above the
+    // bottom rounds up to 1 ulp. mant23 == 0 is the midpoint exactly, and ties go to
+    // even i.e. to zero. sign|1 can't collide with fnuz's 0x80 NaN encoding.
+    if (exp32 == kMinSubnormExp - 1 && mant23 != 0) return sign | 1;
 #if HIP_FP8_TYPE_FNUZ
     // E4M3FNUZ (gfx942) has no negative zero: byte 0x80 is NaN, not -0.0.
     // Returning `sign` (0x80) for an underflowing negative injects NaN into the
@@ -88,9 +95,11 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   } else if (exp32 < kMinNormExp) {
     // Subnormal range
     int32_t shift = -(kBias - 1) - exp32;  // 1..3
-    uint32_t subnorm_mant = (0x800000 | mant23) >> (shift + 20);
-    uint32_t round_bit = ((0x800000 | mant23) >> (shift + 19)) & 1;
-    subnorm_mant += round_bit;
+    const uint32_t full = 0x800000 | mant23;
+    uint32_t subnorm_mant = full >> (shift + 20);
+    const uint32_t guard = (full >> (shift + 19)) & 1;
+    const uint32_t sticky = full & ((1u << (shift + 19)) - 1);
+    subnorm_mant += guard && (sticky || (subnorm_mant & 1));
     mant3 = static_cast<uint8_t>(subnorm_mant & 0x07);
     exp8 = 0;
     if (subnorm_mant > 7) {
@@ -100,13 +109,16 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   } else {
     exp8 = exp32 + kBias;
     mant3 = static_cast<uint8_t>(mant23 >> 20);
-    uint32_t round_bit = (mant23 >> 19) & 1;
-    mant3 += round_bit;
-    if (mant3 > 7) {
-      mant3 = 0;
-      exp8++;
+    // round to nearest even, like the CUDA hardware conversion. bf16 inputs land
+    // exactly on a tie every time, so round-half-up would bias every one of them up
+    if (((mant23 >> 19) & 1) && ((mant23 & 0x7FFFF) || (mant3 & 1))) {
+      mant3++;
+      if (mant3 > 7) {
+        mant3 = 0;
+        exp8++;
+      }
     }
-    if (exp8 >= kMaxExp) return sign | kSaturate;
+    if (exp8 > kMaxExp || (exp8 == kMaxExp && mant3 > kMaxMant)) return sign | kSaturate;
   }
   return sign | (static_cast<uint8_t>(exp8) << 3) | mant3;
 }
