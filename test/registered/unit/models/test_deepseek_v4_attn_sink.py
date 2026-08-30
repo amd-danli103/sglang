@@ -61,6 +61,7 @@ class _AttentionHarness(deepseek_v4.MQALayer):
         attn_backend,
         q_out=None,
         x_quant=None,
+        q_rope_out=None,
     ):
         q_out.zero_()
         return q_out, None
