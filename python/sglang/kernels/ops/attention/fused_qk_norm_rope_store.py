@@ -370,6 +370,15 @@ def _fp8_2buff_store(
         # pools, and aiter bounds-checks neither -- a short rope pool aborts the
         # process with nothing on stderr, so the pair is checked there first.
         assert swa_loc is not None, "fp8 SWA store needs swa_loc alongside the pools"
+        # int32 is the SWA loc contract across the tree (translate_loc_from_full_to_swa
+        # enforces it too), and aiter reads the dest-row array raw -- a wider dtype
+        # becomes garbage row ids and aborts with nothing on stderr
+        assert (
+            swa_loc.dtype == torch.int32
+        ), f"swa_loc must be int32, got {swa_loc.dtype}"
+        assert (
+            swa_loc.shape[0] == kv.shape[0]
+        ), f"swa_loc holds {swa_loc.shape[0]} rows, kv holds {kv.shape[0]}"
         check_two_pool_pair(
             swa_cache,
             swa_rope_cache,
