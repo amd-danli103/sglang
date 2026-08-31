@@ -54,4 +54,9 @@ def check_two_pool_pair(
         f"rope pool is {rope_pool.shape[-1]} x {rope_pool.dtype}, expected "
         f"{rope_width} x {rope_dtype}"
     )
-    assert nope_pool.is_contiguous() and rope_pool.is_contiguous()
+    assert (
+        nope_pool.is_contiguous()
+    ), f"nope pool must be contiguous, got strides {nope_pool.stride()}"
+    assert (
+        rope_pool.is_contiguous()
+    ), f"rope pool must be contiguous, got strides {rope_pool.stride()}"
