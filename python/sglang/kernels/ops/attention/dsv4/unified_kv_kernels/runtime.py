@@ -27,6 +27,7 @@ on via ``topk_length``); the per-token compressed count is recovered from the
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -238,15 +239,23 @@ def decode(
     )
 
 
+@lru_cache(maxsize=None)
 def decode_qo_indptr(num_tokens: int, device: torch.device) -> torch.Tensor:
     """``qo_indptr`` for the two-pool decode: one q token per sequence.
 
     Not ``cu_seqlens_q`` -- that one is per-request and differs once MTP puts
-    several draft tokens in a batch. Layer-independent, so it could be hoisted to
-    one build per forward and sliced, the way hpc_ops_backend does; nobody passes
-    ``qo_indptr`` today, so every layer rebuilds this T+1 arange.
+    several draft tokens in a batch. Cached unbounded like _token_identity_map:
+    all 61 layers ask for the same answer each step, and a captured graph holds
+    the address it got back.
     """
     return torch.arange(num_tokens + 1, dtype=torch.int32, device=device)
+
+
+# aiter sizes the split count off CU occupancy and over-splits just past 40
+# tokens, where the stage-2 merge starts to dominate. 4 rather than each shape's
+# own optimum -- neighbouring split counts swing ~1.5x either way.
+_DECODE_SPLIT_TAIL_MIN_TOKENS = 40
+_DECODE_SPLIT_TAIL_VALUE = 4
 
 
 def decode_fp8_2buff(
@@ -260,6 +269,7 @@ def decode_fp8_2buff(
     attn_sink: torch.Tensor,  # [H] fp32
     v_head_dim: int,
     qo_indptr: Optional[torch.Tensor] = None,
+    num_kv_splits: Optional[int] = None,
 ) -> torch.Tensor:
     """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
 
@@ -314,9 +324,11 @@ def decode_fp8_2buff(
 
     rows = unified_kv.shape[0]
     out = q_rope.new_empty((T, H, v_head_dim))
-    # num_kv_splits stays None: the wrapper's occupancy heuristic picks it, folds
-    # the cross-split merge back into `out`, and leaves the final bf16 there
-    # whether or not it split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
+    # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
+    # merge back into `out`, and leaves the final bf16 there whether or not it
+    # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
+    if num_kv_splits is None and T > _DECODE_SPLIT_TAIL_MIN_TOKENS:
+        num_kv_splits = _DECODE_SPLIT_TAIL_VALUE
     mla_decode_fwd_v4_nm(
         q,
         q_rope,
@@ -328,14 +340,13 @@ def decode_fp8_2buff(
         kv_indices,
         1,  # max_seqlen_q; qo_indptr is per-token so every sequence is one token
         sink=attn_sink,
+        num_kv_splits=num_kv_splits,
     )
-    # Guard, not a live path. A CG-padded row gets seq_len 1, so the builders
-    # hand it a one-row segment on the ring slot ReqToTokenPool reserves for
-    # padding -- never an empty one. If that fill value ever goes to 0 the asm
-    # kernel divides by an all-sink denominator and leaves the row NaN, where the
-    # Triton reader returns zeros; match Triton. Launch-shaped, so CG-safe.
-    empty = kv_indptr[1 : T + 1] == kv_indptr[:T]
-    return out.masked_fill_(empty[:, None, None], 0)
+    # No empty-segment mask: a CG-padded row gets seq_len 1 on the ring slot
+    # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
+    # the compare + masked_fill_ was costing a launch per layer for it. One would
+    # come back NaN now (all-sink denominator); the guard UT pins that.
+    return out
 
 
 @triton.jit
