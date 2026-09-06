@@ -2007,7 +2007,9 @@ class KVCacheConfigurator:
                     )
                 else:
                     if get_memory().enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
 
                         hisparse_cfg = parse_hisparse_config()
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
