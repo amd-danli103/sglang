@@ -728,7 +728,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey, for_reuse: bool = False) -> tuple[
+    def _match_prefix_helper(
+        self, key: RadixKey, for_reuse: bool = False
+    ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,

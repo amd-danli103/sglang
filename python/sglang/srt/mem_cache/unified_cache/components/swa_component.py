@@ -1104,12 +1104,12 @@ class SWAComponent(TreeComponent):
                 new_parent.component_data[self.component_type].host_value = None
             elif len(child_swa_host_value) == full_span:
                 # Common case: host_value spans the whole node; split by key len.
-                new_parent.component_data[self.component_type].host_value = (
-                    child_swa_host_value[:split_len].clone()
-                )
-                child.component_data[self.component_type].host_value = (
-                    child_swa_host_value[split_len:].clone()
-                )
+                new_parent.component_data[
+                    self.component_type
+                ].host_value = child_swa_host_value[:split_len].clone()
+                child.component_data[
+                    self.component_type
+                ].host_value = child_swa_host_value[split_len:].clone()
             else:
                 # host_value holds only the sliding window at the child's end
                 # boundary, so it belongs entirely to the child. The parent's own
@@ -2120,9 +2120,9 @@ class SWAComponent(TreeComponent):
                 continue
             staging.pop((rid, B), None)
             new_parent, action = self.tree_core._split_node(cur.key, cur, split_len)
-            assert (
-                action is None
-            ), "interior SWA carrier cannot be write-through-pending"
+            assert action is None, (
+                "interior SWA carrier cannot be write-through-pending"
+            )
             new_parent._swa_pending_host = host_value
             # Claim the interior carrier's state tiles at (rid, B) when present, but
             # keep the SWA window even on a miss: the match validator excludes a
