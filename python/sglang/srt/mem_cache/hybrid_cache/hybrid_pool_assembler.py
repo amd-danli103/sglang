@@ -1920,6 +1920,7 @@ class _DeepSeekV4Strategy(StackStrategy):
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools=component_host_pools,
+            swa_bit_exact=swa_bit_exact,
             sidecars=sidecars,
             transfer_layer_num=kvcache.end_layer - kvcache.start_layer,
             pools_desc="KV + SWA + DeepSeekV4 sidecars",
@@ -2349,6 +2350,25 @@ def _apply_stack_result(
         cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
         setattr(cache, cache_attr, host_pool)
         setattr(cache.components[ct], component_attr, host_pool)
+
+    if result.swa_bit_exact and ComponentType.SWA in cache.components:
+        swa_comp = cache.components[ComponentType.SWA]
+        swa_comp._strict_bit_exact = True
+        # unified_kv: SWA device ring is positional; enable deferred
+        # positional restore (H->D at prepare_for_extend, after req_pool_idx).
+        swa_comp._unified_positional_swa = getattr(kvcache, "_unified_kv", False)
+        # Phase C: expose the c4/c4-indexer state riding pools + device state
+        # pool lists so the riding helpers (bind/promote/restore/free) can move
+        # state tiles alongside SWA windows. All None unless state riding wired.
+        swa_comp._c4_state_host_pool = getattr(kvcache, "_c4_state_host_pool", None)
+        swa_comp._c4_indexer_state_host_pool = getattr(
+            kvcache, "_c4_indexer_state_host_pool", None
+        )
+        swa_comp._c4_state_layer_index = getattr(kvcache, "_c4_state_layer_index", None)
+        swa_comp._compress_state_pools = getattr(kvcache, "compress_state_pools", None)
+        swa_comp._indexer_compress_state_pools = getattr(
+            kvcache, "indexer_compress_state_pools", None
+        )
 
     for sidecar in result.sidecars:
         cache.register_sidecar_pool(sidecar)
