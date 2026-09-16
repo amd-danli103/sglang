@@ -35,7 +35,7 @@ from sglang.srt.layers.attention.dsv4.compress_hip import (
 )
 from sglang.srt.mem_cache import memory_pool_host as MPH
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
-from sglang.srt.mem_cache.unified_cache.components import swa_component as SC
+from sglang.srt.mem_cache.unified_cache.components import swa as SC
 
 
 def _capture_via_unified(

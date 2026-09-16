@@ -29,11 +29,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as A
 from sglang.srt.mem_cache.unified_cache import unified_tree_core as TC
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     EvictLayer,
 )
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
 FULL = R.BASE_COMPONENT_TYPE
 SWA = ComponentType.SWA
@@ -706,7 +706,10 @@ class TestStrictL3Coupled(unittest.TestCase):
         # builder only wraps the host window it handed back. Drive both so the
         # ring-paged geometry is exercised end to end.
         prep = SWAComponent.prepare_prefetch(comp, 1, prefetch_tokens=prefetch_tokens)
-        if prep.host_indices is None:
+        if prep.staging_tokens == 0:
+            return None
+        host_indices = SWAComponent.alloc_prefetch_staging(comp, prep.staging_tokens)
+        if host_indices is None:
             return None
         # `node` is the matched-prefix anchor (empty after a flush); the strict
         # branch must NOT key off it -- it emits placeholders the controller
@@ -719,9 +722,10 @@ class TestStrictL3Coupled(unittest.TestCase):
             comp,
             node,
             CacheTransferPhase.PREFETCH,
-            host_indices=prep.host_indices,
+            host_indices=host_indices,
             token_ids=list(range(prefetch_tokens)),
             prefetch_tokens=prefetch_tokens,
+            staging_tokens=prep.staging_tokens,
         )
 
     def test_strict_prefetch_emits_placeholder_trailing_window(self):

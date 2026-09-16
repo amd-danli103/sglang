@@ -26,7 +26,7 @@ import torch
 
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.unified_cache.components.swa_component import (
+from sglang.srt.mem_cache.unified_cache.components.swa import (
     _state_locs_for_window,
 )
 
