@@ -28,7 +28,12 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_server_args,
+    get_serving,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -1075,7 +1080,7 @@ def _build_dsv4_rope_entry(
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
+    server_args: Optional[ServerArgs] = None,
     kvcache: Any,
     load_cache_event,
     storage_backend: Optional[str],
@@ -1197,6 +1202,10 @@ def build_deepseek_v4_hicache_stack(
             )
         )
     elif unified_swa_hicache:
+        # only this branch reads server_args; callers that never enable the
+        # strict flag (including main's assembly tests) may omit it
+        if server_args is None:
+            server_args = get_server_args()
         swa_ring_buffers, swa_item_bytes = _dsv4_swa_ring_region_buffers(kvcache)
         num_swa_layers = len(swa_ring_buffers)
         page_bytes = swa_item_bytes * num_swa_layers
