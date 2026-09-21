@@ -1630,33 +1630,31 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            cd = node.component_data[ct]
-            if cd.host_value is not None:
-                # Already populated from a prior backup; do not re-copy.
-                return None
-            pending = getattr(node, "_swa_pending_host", None)
-            if pending is not None:
-                # Adopt the prefill-captured host page through the coordinated
-                # backup, so SWA host_value is set together with Full host_value
-                # and never before. device_indices is None -> write_backup skips
-                # the redundant device->host copy. This also covers interior stride
-                # carriers, which hold a captured window but no device SWA value;
-                # the pending check must precede the ``cd.value is None`` guard
-                # below so they are not skipped.
-                return [
-                    PoolTransfer(
-                        name=PoolName.SWA,
-                        host_indices=pending,
-                        device_indices=None,
-                    )
-                ]
             if self._strict_bit_exact:
-                # Strict: SWA host pages are allocated only at prefill capture
-                # time. With no captured page (host pool full / window missed),
-                # emit no SWA host_value; the node falls back to recompute on
-                # reuse. Never back up the device ring here -- it holds only
-                # the latest window per slot (older windows byte-stale) and
-                # allocating host at backup can exhaust the small SWA pool.
+                cd = node.component_data[ct]
+                if cd.host_value is not None:
+                    # Already populated at capture; do not re-copy.
+                    return None
+                pending = getattr(node, "_swa_pending_host", None)
+                if pending is not None:
+                    # Adopt the prefill-captured host page through the coordinated
+                    # backup, so SWA host_value is set together with Full
+                    # host_value and never before. device_indices is None ->
+                    # write_backup skips the redundant device->host copy. This
+                    # also covers interior stride carriers, which hold a captured
+                    # window but no device SWA value.
+                    return [
+                        PoolTransfer(
+                            name=PoolName.SWA,
+                            host_indices=pending,
+                            device_indices=None,
+                        )
+                    ]
+                # No captured page (host pool full / window missed): emit no SWA
+                # host_value and let the node fall back to recompute on reuse.
+                # Never back up the device ring here -- it holds only the latest
+                # window per slot (older windows byte-stale) and allocating host
+                # at backup can exhaust the small SWA pool.
                 return None
             unbacked_swa_nodes = self._collect_unbacked_swa_nodes(node)
             if not unbacked_swa_nodes:
@@ -1673,9 +1671,8 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # `node` is best_match_node. Full match can sit past a stride /
-            # capture miss; a hole raises LoadBackIncomplete so the whole
-            # load_back aborts rather than landing a stale SWA ring.
+            # `node` is best_match_node; the SWA validator guarantees every
+            # ancestor within `sliding_window_size` has value or host_value.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
@@ -1684,13 +1681,17 @@ class SWAComponent(TreeComponent):
                 cur is not self.tree_core.root_node and n_swa < self.sliding_window_size
             ):
                 cd = cur.component_data[ct]
-                if cd.host_value is None and cd.value is None:
-                    # Full match can sit past a stride/capture miss. Restoring
-                    # Full KV without this window would land a stale device ring,
-                    # so abort the whole load_back (empty spec, recompute).
-                    if self._strict_bit_exact:
-                        raise LoadBackIncomplete()
-                    break
+                if (
+                    self._strict_bit_exact
+                    and cd.host_value is None
+                    and cd.value is None
+                ):
+                    # Strict only: a Full match can sit past a stride/capture
+                    # miss, where the validator's guarantee does not hold.
+                    # Restoring Full KV without this window would land a stale
+                    # device ring, so abort the whole load_back and recompute.
+                    raise LoadBackIncomplete()
+                assert cd.host_value is not None or cd.value is not None
                 if self._strict_bit_exact and cd.host_value is not None:
                     # The device SWA ring is not durable cross-request truth even
                     # when `cd.value` is still set -- it may be a recycled slot
