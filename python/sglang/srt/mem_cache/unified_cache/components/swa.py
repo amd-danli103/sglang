@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     EvictLayer,
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
+    LoadBackIncomplete,
     LRURefreshPhase,
     PreparePrefetchResult,
     TreeComponent,
@@ -726,8 +727,11 @@ class SWAComponent(TreeComponent):
         state = {"len": float("inf")}
 
         # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
-        # must not gate prefix matching.
-        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
+        # must not gate prefix matching. is_swa_req_ring is False for None /
+        # non-SWA allocators (unit-test stubs included).
+        swa_req_ring = is_swa_req_ring(
+            getattr(self.cache, "token_to_kv_pool_allocator", None)
+        )
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -1669,8 +1673,9 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # `node` is best_match_node; the SWA validator guarantees every
-            # ancestor within `sliding_window_size` has value or host_value.
+            # `node` is best_match_node. Full match can sit past a stride /
+            # capture miss; a hole raises LoadBackIncomplete so the whole
+            # load_back aborts rather than landing a stale SWA ring.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
@@ -1679,7 +1684,13 @@ class SWAComponent(TreeComponent):
                 cur is not self.tree_core.root_node and n_swa < self.sliding_window_size
             ):
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
+                if cd.host_value is None and cd.value is None:
+                    # Full match can sit past a stride/capture miss. Restoring
+                    # Full KV without this window would land a stale device ring,
+                    # so abort the whole load_back (empty spec, recompute).
+                    if self._strict_bit_exact:
+                        raise LoadBackIncomplete()
+                    break
                 if self._strict_bit_exact and cd.host_value is not None:
                     # The device SWA ring is not durable cross-request truth even
                     # when `cd.value` is still set -- it may be a recycled slot

@@ -822,7 +822,10 @@ class TestReuseValidatorStateGate(unittest.TestCase):
             component_type="SWA",
             _strict_bit_exact=strict,
             _swa_kv_pool_host=object(),  # not None -> not swa_device_only_hicache
-            cache=types.SimpleNamespace(cache_controller=None),
+            cache=types.SimpleNamespace(
+                cache_controller=None,
+                token_to_kv_pool_allocator=None,
+            ),
             tree_core=types.SimpleNamespace(
                 has_swa_host_pool=True, enable_hicache=False
             ),

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LoadBackIncomplete,
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import (
     SWAComponent,
@@ -330,7 +331,10 @@ class TestStrictMatchValidatorI2Prime(unittest.TestCase):
             component_type=SWA,
             _swa_kv_pool_host=object(),  # host pool wired => feature on, not device-only
             _strict_bit_exact=strict,
-            cache=types.SimpleNamespace(cache_controller=object()),
+            cache=types.SimpleNamespace(
+                cache_controller=object(),
+                token_to_kv_pool_allocator=None,
+            ),
             tree_core=types.SimpleNamespace(
                 has_swa_host_pool=True, enable_hicache=True
             ),
@@ -697,6 +701,32 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
         # this single-node chain -> no transfer at all.
         self.assertIsNone(transfers)
 
+    def test_load_back_hole_aborts_instead_of_assert(self):
+        # Full match can be deeper than the SWA-backed prefix (stride /
+        # concurrent capture miss). Asserting here killed the E1b scheduler.
+        root = types.SimpleNamespace(component_data={}, parent=None)
+        hole = types.SimpleNamespace(
+            id=1,
+            parent=root,
+            component_data={SWA: _cd(value=None, host_value=None)},
+        )
+        leaf = types.SimpleNamespace(
+            id=2,
+            parent=hole,
+            component_data={
+                SWA: _cd(
+                    value=None,
+                    host_value=torch.tensor([1, 1], dtype=torch.int64),
+                )
+            },
+        )
+        comp = self._comp(strict=True)
+        comp.tree_core.root_node = root
+        with self.assertRaises(LoadBackIncomplete):
+            SWAComponent.build_hicache_transfers(
+                comp, leaf, CacheTransferPhase.LOAD_BACK
+            )
+
 
 class TestLoadBackMappingLengths(unittest.TestCase):
     """S3 contract: commit_hicache_transfer(LOAD_BACK) must feed equal-length
@@ -809,7 +839,10 @@ class TestSparseSwaReuseClamp(unittest.TestCase):
             component_type=SWA,
             _swa_kv_pool_host=object(),  # feature on (not device-only hicache)
             _strict_bit_exact=True,
-            cache=types.SimpleNamespace(cache_controller=object()),
+            cache=types.SimpleNamespace(
+                cache_controller=object(),
+                token_to_kv_pool_allocator=None,
+            ),
             tree_core=types.SimpleNamespace(
                 has_swa_host_pool=True, enable_hicache=True
             ),

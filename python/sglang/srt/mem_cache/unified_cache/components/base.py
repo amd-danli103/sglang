@@ -87,6 +87,10 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
+class LoadBackIncomplete(Exception):
+    """Component cannot restore its window; the whole load_back must abort."""
+
+
 class LinkerTransferPhase(str, Enum):
     LOOKUP = "lookup"
     LOAD = "load"

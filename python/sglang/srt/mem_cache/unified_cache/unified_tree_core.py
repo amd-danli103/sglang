@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache.components.base import LoadBackIncomplete
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -2339,9 +2340,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            t = comp.build_hicache_transfers(
-                node, CacheTransferPhase.LOAD_BACK, mamba_pool_idx=mamba_pool_idx
-            )
+            try:
+                t = comp.build_hicache_transfers(
+                    node, CacheTransferPhase.LOAD_BACK, mamba_pool_idx=mamba_pool_idx
+                )
+            except LoadBackIncomplete:
+                # Same empty spec as a foreign pin: caller backs off and recomputes
+                # instead of loading Full KV onto a stale SWA ring.
+                empty_kv = PoolTransfer(
+                    name=PoolName.KV,
+                    host_indices=torch.empty((0,), dtype=torch.int64, device="cpu"),
+                    nodes_to_load=[],
+                )
+                return empty_kv, {}
             if t:
                 comp_xfers[comp.component_type] = t
         # Reject transfers that would claim a node pinned by another load-back
