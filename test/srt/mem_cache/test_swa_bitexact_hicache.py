@@ -491,7 +491,9 @@ class TestSwaRegionBuffers(unittest.TestCase):
     Row-granular device buffers (head_dim rows) declared with a page-granular
     item_bytes mismatch in transfer_kv_direct and crash."""
 
-    def _fake_pool(self, *, num_slots, ring_size, head_dim, compress_rows, layers):
+    def _fake_pool(
+        self, *, num_slots, ring_size, head_dim, compress_rows, layers, fp8=False
+    ):
         import torch
 
         swa_pages = num_slots * ring_size
@@ -505,9 +507,26 @@ class TestSwaRegionBuffers(unittest.TestCase):
         )
         return types.SimpleNamespace(
             _unified_kv=True,
+            _unified_kv_fp8=fp8,
             unified_swa_ring_size=ring_size,
             unified_kv_pool=unified_kv_pool,
         )
+
+    def test_rejects_unified_kv_fp8(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool as P,
+        )
+
+        pool = self._fake_pool(
+            num_slots=3,
+            ring_size=2,
+            head_dim=4,
+            compress_rows=8,
+            layers=2,
+            fp8=True,
+        )
+        with self.assertRaises(NotImplementedError):
+            P.swa_region_buffers(pool)
 
     def test_page_granular_geometry(self):
         import torch

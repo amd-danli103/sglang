@@ -1773,8 +1773,10 @@ class SWAComponent(TreeComponent):
                 if self._strict_bit_exact
                 else self.tree_core.page_size
             )
-            sized = staging_tokens if staging_tokens else (
-                host_indices.numel() if host_indices is not None else 0
+            sized = (
+                staging_tokens
+                if staging_tokens
+                else (host_indices.numel() if host_indices is not None else 0)
             )
             num_pages = sized // stride
             if num_pages == 0:
